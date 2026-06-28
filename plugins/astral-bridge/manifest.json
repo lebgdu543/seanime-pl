@@ -1,7 +1,7 @@
 {
   "id": "astral-bridge",
   "name": "Astral-Manga Bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "language": "typescript",
   "type": "plugin",
   "description": "Solves Cloudflare challenge for astral-manga.fr manga provider",
