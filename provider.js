@@ -11,16 +11,17 @@
  *   Chapter: GET /manga/{urlId}/chapter/{chapterUuid}
  *   Images:  GET /api/s3/presign-get?key=...
  *
- * Cloudflare bypass: the site is behind Cloudflare. We warm up the session
- * by visiting the homepage first, which triggers the JS challenge in Electron's
- * Chromium engine and sets the cf_clearance cookie for all subsequent requests.
+ * Cloudflare: Goja's fetch() does NOT execute JavaScript, so it can't
+ * solve Cloudflare challenges. The user MUST open https://astral-manga.fr
+ * in Seanime's built-in browser (WebView) FIRST. That lets Electron's
+ * Chromium engine solve the challenge and store cf_clearance in the
+ * Electron session cookie jar. If fetch() shares that session, API calls
+ * will then work.
  */
 
 class Provider {
     constructor() {
         this.api = 'https://astral-manga.fr';
-        this._warmedUp = false;
-        this._warmingUp = null;
     }
 
     getSettings() {
@@ -31,80 +32,51 @@ class Provider {
     }
 
     // =================================================================
-    //  Cloudflare warmup
+    //  Cloudflare — cookie check
     // =================================================================
 
     /**
-     * Visit the homepage to trigger Cloudflare's JS challenge.
-     * In Electron, the JS challenge runs in the Chromium engine and sets
-     * cf_clearance. If fetch() shares the Electron cookie jar, subsequent
-     * API calls will pass through Cloudflare.
+     * Probe whether we can reach the site. If 403, the user hasn't
+     * visited astral-manga.fr in Seanime's browser yet and Cloudflare
+     * is blocking us. Print a clear action message.
      *
-     * If fetch() does NOT share cookies (Goja polyfill), this won't help
-     * and we fall back to scraping the search page HTML.
+     * No setTimeout — Goja doesn't support it.
      */
-    async _warmup() {
-        if (this._warmedUp) return;
-        if (this._warmingUp) return this._warmingUp;
+    async _checkCookies() {
+        if (typeof this._cookiesOk !== 'undefined') return this._cookiesOk;
 
-        this._warmingUp = (async () => {
-            try {
-                console.log('[astral] Warmup: visiting homepage to solve Cloudflare challenge...');
+        try {
+            var res = await fetch(this.api + '/', {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
+                },
+            });
 
-                // Step 1: hit the homepage
-                var homeRes = await fetch(this.api + '/', {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-                    },
-                });
-
-                console.log('[astral] Warmup: homepage status ' + homeRes.status);
-                var homeText = await homeRes.text();
-
-                var isChallenge = homeText.indexOf('Just a moment') !== -1 ||
-                                  homeText.indexOf('challenge-platform') !== -1 ||
-                                  homeText.indexOf('cf-browser-verification') !== -1;
-
-                if (isChallenge) {
-                    console.log('[astral] Warmup: Cloudflare challenge detected, waiting 5s for JS to solve...');
-                    // The challenge JS runs automatically in Electron's Chromium.
-                    // Give it time to complete.
-                    await new Promise(function (resolve) {
-                        setTimeout(resolve, 5000);
-                    });
-
-                    // Retry — if cookies are shared, this should go through
-                    var retryRes = await fetch(this.api + '/', {
-                        headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-                        },
-                    });
-                    var retryText = await retryRes.text();
-                    console.log('[astral] Warmup: retry status ' + retryRes.status);
-
-                    if (retryText.indexOf('Just a moment') !== -1 || retryRes.status === 403) {
-                        console.warn('[astral] Warmup: STILL BLOCKED after retry — fetch() may not share Electron cookies');
-                    } else {
-                        console.log('[astral] Warmup: challenge solved ✓');
-                        this._cfCookiesWork = true;
-                    }
-                } else if (homeRes.status === 200 && homeText.indexOf('<html') !== -1) {
-                    console.log('[astral] Warmup: got homepage directly (no challenge) ✓');
-                    this._cfCookiesWork = true;
-                } else {
-                    console.log('[astral] Warmup: homepage returned status ' + homeRes.status + ' (unexpected, but continuing)');
-                }
-            } catch (e) {
-                console.warn('[astral] Warmup: error — ' + (e.message || e));
+            if (res.status === 200) {
+                console.log('[astral] Cookie check: homepage accessible ✓');
+                this._cookiesOk = true;
+            } else if (res.status === 403) {
+                console.warn('[astral] Cookie check: 403 Forbidden.');
+                console.warn('[astral] ┌─────────────────────────────────────────────┐');
+                console.warn('[astral] │  ACTION REQUIRED                             │');
+                console.warn('[astral] │  Open https://astral-manga.fr in Seanime\'s   │');
+                console.warn('[astral] │  built-in browser (WebView), wait for the     │');
+                console.warn('[astral] │  page to load, then search again.             │');
+                console.warn('[astral] │  This solves the Cloudflare challenge once.   │');
+                console.warn('[astral] └─────────────────────────────────────────────┘');
+                this._cookiesOk = false;
+            } else {
+                console.log('[astral] Cookie check: status ' + res.status + ' (trying anyway)');
+                this._cookiesOk = true;  // not 403 — might work
             }
-            this._warmedUp = true;
-        })();
+        } catch (e) {
+            console.warn('[astral] Cookie check: error — ' + (e.message || e));
+            this._cookiesOk = false;
+        }
 
-        return this._warmingUp;
+        return this._cookiesOk;
     }
 
     // =================================================================
@@ -112,7 +84,7 @@ class Provider {
     // =================================================================
 
     /**
-     * Fetch with browser-mimicking headers + X-Requested-With (helps with some CF configs).
+     * Fetch with browser-mimicking headers + X-Requested-With.
      */
     async _fetch(url, extraHeaders) {
         var headers = {
@@ -135,7 +107,6 @@ class Provider {
 
     /**
      * Resolve an S3 key to a presigned URL.
-     * Handles: "s3:uploads/projects/..." or "uploads/projects/..."
      */
     resolveImage(s3Key) {
         var raw = s3Key;
@@ -172,7 +143,6 @@ class Provider {
         try {
             return JSON.parse(combined);
         } catch (e) {
-            // Try line-by-line
             var lines = combined.split('\n');
             for (var i = 0; i < lines.length; i++) {
                 if (!lines[i]) continue;
@@ -195,28 +165,24 @@ class Provider {
     _findBySignature(node, type) {
         if (!node || typeof node !== 'object') return null;
 
-        // Manga: has "title" string AND "chapters" array
         if (!type || type === 'manga') {
             if (typeof node.title === 'string' && Array.isArray(node.chapters)) {
                 return { type: 'manga', data: node };
             }
         }
 
-        // Chapter: has "id" string AND "images" array (but NOT "chapters")
         if (!type || type === 'chapter') {
             if (typeof node.id === 'string' && Array.isArray(node.images) && !Array.isArray(node.chapters)) {
                 return { type: 'chapter', data: node };
             }
         }
 
-        // RSC image with orderId
         if (type === 'image') {
             if (typeof node.link === 'string' && typeof node.orderId === 'number') {
                 return { type: 'image', data: node };
             }
         }
 
-        // Recurse
         if (Array.isArray(node)) {
             for (var i = 0; i < node.length; i++) {
                 var found = this._findBySignature(node[i], type);
@@ -303,68 +269,39 @@ class Provider {
     //  Provider Interface
     // =================================================================
 
-    /**
-     * Search via the /api/mangas REST endpoint (same as Tachiyomi extension).
-     *
-     * API returns: { mangas: [{ id, title, urlId, cover: { image: { link } } }], total: N }
-     */
     async search(opts) {
         var q = (opts.query || '').trim();
+        if (!q) return [];
 
-        if (!q) {
-            return [];
-        }
-
-        // Warm up Cloudflare session first
-        await this._warmup();
+        await this._checkCookies();
 
         var searchUrl = this.api + '/api/mangas' +
             '?query=' + encodeURIComponent(q) +
-            '&page=1' +
-            '&pageSize=12' +
-            '&sortBy=title' +
-            '&sortOrder=asc' +
-            '&includeMode=and' +
-            '&excludeMode=or';
+            '&page=1&pageSize=12&sortBy=title&sortOrder=asc' +
+            '&includeMode=and&excludeMode=or';
 
         try {
             var res = await this._fetch(searchUrl);
-
-            if (!res.ok) {
-                return [];
-            }
+            if (!res.ok) return [];
 
             var text = await res.text();
 
-            // Check for Cloudflare block (even after warmup)
             if (text.indexOf('Just a moment') !== -1) {
-                // Retry warmup once
-                this._warmedUp = false;
-                await this._warmup();
-                var retryRes = await this._fetch(searchUrl);
-                if (!retryRes.ok) return [];
-                text = await retryRes.text();
-                if (text.indexOf('Just a moment') !== -1) return [];
+                console.warn('[astral] search: Cloudflare block. Visit astral-manga.fr in Seanime\'s browser first.');
+                return [];
             }
 
-            // Check for HTML (RSC or regular page) instead of JSON
             if (text.indexOf('{') !== 0 && text.indexOf('[') !== 0) {
-                // Try RSC parsing as fallback
                 var rscParsed = this.parseRSC(text);
                 if (rscParsed) {
                     var foundMangas = this._findAllMangas(rscParsed);
-                    if (foundMangas.length > 0) {
-                        return foundMangas;
-                    }
+                    if (foundMangas.length > 0) return foundMangas;
                 }
                 return [];
             }
 
             var json = JSON.parse(text);
-
-            if (!json.mangas || !Array.isArray(json.mangas)) {
-                return [];
-            }
+            if (!json.mangas || !Array.isArray(json.mangas)) return [];
 
             var results = [];
             for (var i = 0; i < json.mangas.length; i++) {
@@ -373,23 +310,18 @@ class Provider {
                 if (m.cover && m.cover.image && m.cover.image.link) {
                     img = this.resolveImage(m.cover.image.link);
                 }
-
                 results.push({
                     id: m.urlId || m.id || '',
                     title: m.title || '',
                     image: img,
                 });
             }
-
             return results;
         } catch (e) {
             return [];
         }
     }
 
-    /**
-     * Find ALL manga-like objects in RSC tree (for search fallback).
-     */
     _findAllMangas(node, found) {
         if (!found) found = [];
         if (!node || typeof node !== 'object') return found;
@@ -428,61 +360,37 @@ class Provider {
         return found;
     }
 
-    /**
-     * Get chapters for a manga via RSC header.
-     */
     async findChapters(seriesId) {
-        if (!this.isUUID(seriesId)) {
-            return [];
-        }
+        if (!this.isUUID(seriesId)) return [];
 
-        // Warm up Cloudflare session first
-        await this._warmup();
+        await this._checkCookies();
 
         try {
-            var res = await this._fetch(this.api + '/manga/' + seriesId, {
-                'RSC': '1'
-            });
-
-            if (!res.ok) {
-                return [];
-            }
+            var res = await this._fetch(this.api + '/manga/' + seriesId, { 'RSC': '1' });
+            if (!res.ok) return [];
 
             var html = await res.text();
-
-            // Check for Cloudflare block
-            if (html.indexOf('Just a moment') !== -1) {
-                return [];
-            }
+            if (html.indexOf('Just a moment') !== -1) return [];
 
             var parsed = this.parseRSC(html);
-            if (!parsed) {
-                return [];
-            }
+            if (!parsed) return [];
 
             var mangaObj = this._findBySignature(parsed, 'manga');
             var mangaData = mangaObj ? mangaObj.data : parsed;
             var mangaInternalId = '';
-            if (mangaData && mangaData.id) {
-                mangaInternalId = mangaData.id;
-            }
+            if (mangaData && mangaData.id) mangaInternalId = mangaData.id;
 
             var chapterNodes = this._findAllChapters(parsed, mangaInternalId);
 
             if (chapterNodes.length === 0) {
-                // Retry with cache-bust
-                var retryUrl = this.api + '/manga/' + seriesId + '?_=' + Date.now();
-                var retryRes = await this._fetch(retryUrl, {
-                    'RSC': '1',
-                    'Cache-Control': 'no-cache'
-                });
-
+                var retryRes = await this._fetch(
+                    this.api + '/manga/' + seriesId + '?_=' + Date.now(),
+                    { 'RSC': '1', 'Cache-Control': 'no-cache' }
+                );
                 if (retryRes.ok) {
                     var retryHtml = await retryRes.text();
                     var retryParsed = this.parseRSC(retryHtml);
-                    if (retryParsed) {
-                        chapterNodes = this._findAllChapters(retryParsed, mangaInternalId);
-                    }
+                    if (retryParsed) chapterNodes = this._findAllChapters(retryParsed, mangaInternalId);
                 }
             }
 
@@ -490,18 +398,9 @@ class Provider {
             for (var i = 0; i < chapterNodes.length; i++) {
                 var ch = chapterNodes[i];
                 var num = ch.orderId;
-                var numStr;
-                if (num % 1 === 0) {
-                    numStr = String(Math.floor(num));
-                } else {
-                    numStr = String(num);
-                }
-
-                // Composite ID: urlId|chapterUuid
-                var compositeId = seriesId + '|' + ch.id;
-
+                var numStr = (num % 1 === 0) ? String(Math.floor(num)) : String(num);
                 chapters.push({
-                    id: compositeId,
+                    id: seriesId + '|' + ch.id,
                     url: '/manga/' + seriesId + '/chapter/' + ch.id,
                     title: 'Chapitre ' + numStr,
                     chapter: numStr,
@@ -509,17 +408,10 @@ class Provider {
                 });
             }
 
-            // Sort by chapter number descending (newest first)
             chapters.sort(function (a, b) {
-                var aNum = parseFloat(a.chapter);
-                var bNum = parseFloat(b.chapter);
-                return bNum - aNum;
+                return parseFloat(b.chapter) - parseFloat(a.chapter);
             });
-
-            // Re-index after sort
-            for (var j = 0; j < chapters.length; j++) {
-                chapters[j].index = j;
-            }
+            for (var j = 0; j < chapters.length; j++) chapters[j].index = j;
 
             return chapters;
         } catch (e) {
@@ -527,48 +419,29 @@ class Provider {
         }
     }
 
-    /**
-     * Get page images for a chapter.
-     *
-     * Strategy 1: RSC data for image objects with link + orderId
-     * Strategy 2: Regex for s3: keys in the HTML
-     * Strategy 3: <img alt~=^Page \d+> elements
-     */
     async findChapterPages(chapterId) {
-        // Warm up Cloudflare session first
-        await this._warmup();
+        await this._checkCookies();
 
         try {
             var parts = chapterId.split('|');
-            if (parts.length !== 2) {
-                return [];
-            }
+            if (parts.length !== 2) return [];
 
             var mangaId = parts[0];
             var chId = parts[1];
-
             var url = this.api + '/manga/' + mangaId + '/chapter/' + chId;
 
             var res = await this._fetch(url);
-
-            if (!res.ok) {
-                return [];
-            }
+            if (!res.ok) return [];
 
             var html = await res.text();
+            if (html.indexOf('Just a moment') !== -1) return [];
 
-            // Check for Cloudflare block
-            if (html.indexOf('Just a moment') !== -1) {
-                return [];
-            }
-
-            // Strategy 1: Parse RSC data for RscImageDto objects
+            // Strategy 1: RSC image objects
             var parsed = this.parseRSC(html);
             if (parsed) {
                 var images = this._findAllImages(parsed);
                 if (images.length > 0) {
                     images.sort(function (a, b) { return a.orderId - b.orderId; });
-
                     var pages = [];
                     for (var i = 0; i < images.length; i++) {
                         var imgUrl;
@@ -579,17 +452,13 @@ class Provider {
                         } else {
                             imgUrl = this.api + images[i].link;
                         }
-                        pages.push({
-                            url: imgUrl,
-                            index: i,
-                            headers: { 'Referer': url },
-                        });
+                        pages.push({ url: imgUrl, index: i, headers: { 'Referer': url } });
                     }
                     return pages;
                 }
             }
 
-            // Strategy 2: Regex for s3: keys in the HTML
+            // Strategy 2: s3: keys in HTML
             var s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
             var s3Keys = html.match(s3KeyRegex);
             if (s3Keys && s3Keys.length > 0) {
@@ -600,19 +469,14 @@ class Provider {
                     }
                 }
                 var keys = pageKeys.length > 0 ? pageKeys : s3Keys;
-
                 var pages2 = [];
                 for (var p = 0; p < keys.length; p++) {
-                    pages2.push({
-                        url: this.resolveImage(keys[p]),
-                        index: p,
-                        headers: { 'Referer': url },
-                    });
+                    pages2.push({ url: this.resolveImage(keys[p]), index: p, headers: { 'Referer': url } });
                 }
                 return pages2;
             }
 
-            // Strategy 3: <img alt~=^Page \d+> elements
+            // Strategy 3: <img alt="Page N"> elements
             var imgRegex = /<img[^>]*alt="Page \d+"[^>]*src="([^"]+)"/gi;
             var imgMatches = html.match(imgRegex);
             if (imgMatches && imgMatches.length > 0) {
@@ -623,14 +487,8 @@ class Provider {
                     var srcMatch = srcRegex.exec(imgMatches[m]);
                     if (srcMatch && srcMatch[1]) {
                         var src = srcMatch[1];
-                        if (src.indexOf('http') !== 0) {
-                            src = this.api + src;
-                        }
-                        pages3.push({
-                            url: src,
-                            index: idx,
-                            headers: { 'Referer': url },
-                        });
+                        if (src.indexOf('http') !== 0) src = this.api + src;
+                        pages3.push({ url: src, index: idx, headers: { 'Referer': url } });
                         idx++;
                     }
                 }
