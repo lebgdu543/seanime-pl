@@ -3,18 +3,16 @@
 /**
  * Seanime Manga Provider for Astral-Manga.fr
  *
- * Site: French manga/manhwa scanlation (Next.js App Router)
+ * French manga/manhwa scanlation site (Next.js App Router)
  *
- * API endpoints (discovered from working Tachiyomi extension):
+ * API endpoints (from working Tachiyomi extension):
  *   Search:  GET /api/mangas?query=...&page=1&pageSize=20
- *   Manga:   GET /manga/{urlId}  (RSC: 1 header for details)
+ *   Manga:   GET /manga/{urlId}  (RSC: 1 header for chapter list)
  *   Chapter: GET /manga/{urlId}/chapter/{chapterUuid}
  *   Images:  GET /api/s3/presign-get?key=...
  */
 
 class Provider {
-    api;
-
     constructor() {
         this.api = 'https://astral-manga.fr';
     }
@@ -31,19 +29,7 @@ class Provider {
     // =================================================================
 
     /**
-     * Resolve an S3 key to a presigned URL.
-     * Handles: "s3:uploads/projects/...", "uploads/projects/...", or already-presigned URLs
-     */
-    resolveImage(s3Key) {
-        var raw = s3Key;
-        if (raw.indexOf('s3:') === 0) {
-            raw = raw.substring(3);
-        }
-        return this.api + '/api/s3/presign-get?key=' + encodeURIComponent(raw);
-    }
-
-    /**
-     * Fetch helper with browser-mimicking headers to pass Cloudflare.
+     * Fetch with browser-mimicking headers + X-Requested-With (helps with some CF configs).
      */
     async _fetch(url, extraHeaders) {
         var headers = {
@@ -51,6 +37,7 @@ class Provider {
             'Accept': 'application/json, text/html, */*',
             'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
             'Referer': this.api + '/',
+            'X-Requested-With': 'XMLHttpRequest',
         };
 
         if (extraHeaders) {
@@ -64,9 +51,26 @@ class Provider {
     }
 
     /**
+     * Resolve an S3 key to a presigned URL.
+     * Handles: "s3:uploads/projects/..." or "uploads/projects/..."
+     */
+    resolveImage(s3Key) {
+        var raw = s3Key;
+        if (raw.indexOf('s3:') === 0) {
+            raw = raw.substring(3);
+        }
+        return this.api + '/api/s3/presign-get?key=' + encodeURIComponent(raw);
+    }
+
+    /**
+     * Check if a string looks like an Astral UUID (36-char hex with dashes).
+     */
+    isUUID(str) {
+        return !!(str && str.length === 36 && str.indexOf('-') !== -1);
+    }
+
+    /**
      * Parse React Server Components wire format from HTML.
-     * Extracts all self.__next_f.push([1,"..."]) chunks, unescapes them,
-     * and tries to parse a JSON tree.
      */
     parseRSC(text) {
         var pushRegex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
@@ -85,6 +89,7 @@ class Provider {
         try {
             return JSON.parse(combined);
         } catch (e) {
+            // Try line-by-line
             var lines = combined.split('\n');
             for (var i = 0; i < lines.length; i++) {
                 if (!lines[i]) continue;
@@ -102,33 +107,33 @@ class Provider {
     }
 
     /**
-     * Walk a parsed object tree looking for manga or chapter data.
+     * Walk parsed object tree looking for manga/chapter data.
      */
     _findBySignature(node, type) {
         if (!node || typeof node !== 'object') return null;
 
-        // Manga signature: has "title" string AND "chapters" array
+        // Manga: has "title" string AND "chapters" array
         if (!type || type === 'manga') {
             if (typeof node.title === 'string' && Array.isArray(node.chapters)) {
                 return { type: 'manga', data: node };
             }
         }
 
-        // Chapter signature: has "id" string AND "images" array (but NOT "chapters")
+        // Chapter: has "id" string AND "images" array (but NOT "chapters")
         if (!type || type === 'chapter') {
             if (typeof node.id === 'string' && Array.isArray(node.images) && !Array.isArray(node.chapters)) {
                 return { type: 'chapter', data: node };
             }
         }
 
-        // RSC image with orderId (for image extraction)
+        // RSC image with orderId
         if (type === 'image') {
             if (typeof node.link === 'string' && typeof node.orderId === 'number') {
                 return { type: 'image', data: node };
             }
         }
 
-        // Recurse into arrays
+        // Recurse
         if (Array.isArray(node)) {
             for (var i = 0; i < node.length; i++) {
                 var found = this._findBySignature(node[i], type);
@@ -148,8 +153,7 @@ class Provider {
     }
 
     /**
-     * Walk parsed RSC data to find ALL chapter objects (not just the first).
-     * Returns array of { id, orderId, publishDate, mangaId }.
+     * Walk RSC tree to find ALL chapter objects.
      */
     _findAllChapters(node, mangaId, found) {
         if (!found) found = [];
@@ -157,7 +161,6 @@ class Provider {
 
         if (typeof node.id === 'string' && typeof node.orderId === 'number' && typeof node.mangaId === 'string') {
             if (node.mangaId === mangaId || !mangaId) {
-                // Deduplicate by id
                 var dup = false;
                 for (var i = 0; i < found.length; i++) {
                     if (found[i].id === node.id) { dup = true; break; }
@@ -183,11 +186,34 @@ class Provider {
     }
 
     /**
-     * Check if a string looks like an Astral UUID (36-char hex with dashes).
-     * Non-UUID values are likely AniList IDs.
+     * Walk RSC tree to find ALL image objects.
      */
-    isUUID(str) {
-        return str && str.length === 36 && str.indexOf('-') !== -1;
+    _findAllImages(node, found) {
+        if (!found) found = [];
+        if (!node || typeof node !== 'object') return found;
+
+        if (typeof node.link === 'string' && typeof node.orderId === 'number') {
+            var dup = false;
+            for (var i = 0; i < found.length; i++) {
+                if (found[i].link === node.link) { dup = true; break; }
+            }
+            if (!dup) found.push({ link: node.link, orderId: node.orderId });
+        }
+
+        if (Array.isArray(node)) {
+            for (var j = 0; j < node.length; j++) {
+                this._findAllImages(node[j], found);
+            }
+        } else if (typeof node === 'object') {
+            var keys = Object.keys(node);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === '__proto__' || key === 'constructor') continue;
+                this._findAllImages(node[key], found);
+            }
+        }
+
+        return found;
     }
 
     // =================================================================
@@ -195,14 +221,18 @@ class Provider {
     // =================================================================
 
     /**
-     * Search for manga via the /api/mangas REST endpoint.
+     * Search via the /api/mangas REST endpoint (same as Tachiyomi extension).
      *
-     * The API returns JSON:
-     *   { mangas: [{ id, title, urlId, cover: { image: { link } } }], total: N }
+     * API returns: { mangas: [{ id, title, urlId, cover: { image: { link } } }], total: N }
      */
     async search(opts) {
         var q = (opts.query || '').trim();
-        if (!q) return [];
+        console.log('[astral] search() called with query:', JSON.stringify(q));
+
+        if (!q) {
+            console.log('[astral] search: empty query, returning []');
+            return [];
+        }
 
         var searchUrl = this.api + '/api/mangas' +
             '?query=' + encodeURIComponent(q) +
@@ -213,14 +243,51 @@ class Provider {
             '&includeMode=and' +
             '&excludeMode=or';
 
+        console.log('[astral] search URL:', searchUrl);
+
         try {
             var res = await this._fetch(searchUrl);
+            console.log('[astral] search HTTP status:', res.status);
 
-            if (!res.ok) return [];
+            if (!res.ok) {
+                console.warn('[astral] search: HTTP error', res.status);
+                return [];
+            }
 
-            var json = await res.json();
+            var text = await res.text();
+            console.log('[astral] search response length:', text.length);
 
-            if (!json || !json.mangas || !Array.isArray(json.mangas)) return [];
+            // Check for Cloudflare block
+            if (text.indexOf('Just a moment') !== -1) {
+                console.error('[astral] search: Cloudflare challenge page returned!');
+                return [];
+            }
+
+            // Check for HTML (RSC or regular page) instead of JSON
+            if (text.indexOf('{') !== 0 && text.indexOf('[') !== 0) {
+                console.warn('[astral] search: response is not JSON, trying RSC parse...');
+                // Try RSC parsing as fallback
+                var rscParsed = this.parseRSC(text);
+                if (rscParsed) {
+                    console.log('[astral] search: RSC parsed successfully, walking tree...');
+                    // Walk the tree for manga-like objects
+                    var foundMangas = this._findAllMangas(rscParsed);
+                    console.log('[astral] search: found', foundMangas.length, 'mangas in RSC tree');
+                    if (foundMangas.length > 0) {
+                        return foundMangas;
+                    }
+                }
+                return [];
+            }
+
+            var json = JSON.parse(text);
+            console.log('[astral] search JSON keys:', Object.keys(json).join(', '));
+            console.log('[astral] search total:', json.total, 'mangas:', json.mangas ? json.mangas.length : 'missing');
+
+            if (!json.mangas || !Array.isArray(json.mangas)) {
+                console.warn('[astral] search: no mangas array in response');
+                return [];
+            }
 
             var results = [];
             for (var i = 0; i < json.mangas.length; i++) {
@@ -237,51 +304,105 @@ class Provider {
                 });
             }
 
+            console.log('[astral] search: returning', results.length, 'results');
             return results;
         } catch (e) {
+            console.error('[astral] search exception:', e.message || e);
             return [];
         }
     }
 
     /**
-     * Get chapters for a manga.
-     *
-     * Uses RSC: 1 header to get structured data from the manga page,
-     * then extracts chapter objects from the React tree.
+     * Find ALL manga-like objects in RSC tree (for search fallback).
+     */
+    _findAllMangas(node, found) {
+        if (!found) found = [];
+        if (!node || typeof node !== 'object') return found;
+
+        if (typeof node.title === 'string' && typeof node.urlId === 'string') {
+            var dup = false;
+            for (var i = 0; i < found.length; i++) {
+                if (found[i].id === node.urlId) { dup = true; break; }
+            }
+            if (!dup && node.title.trim()) {
+                var img;
+                if (node.cover && node.cover.image && node.cover.image.link) {
+                    img = this.resolveImage(node.cover.image.link);
+                }
+                found.push({
+                    id: node.urlId,
+                    title: node.title,
+                    image: img,
+                });
+            }
+        }
+
+        if (Array.isArray(node)) {
+            for (var j = 0; j < node.length; j++) {
+                this._findAllMangas(node[j], found);
+            }
+        } else if (typeof node === 'object') {
+            var keys = Object.keys(node);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === '__proto__' || key === 'constructor') continue;
+                this._findAllMangas(node[key], found);
+            }
+        }
+
+        return found;
+    }
+
+    /**
+     * Get chapters for a manga via RSC header.
      */
     async findChapters(seriesId) {
+        console.log('[astral] findChapters called with:', seriesId);
+
         if (!this.isUUID(seriesId)) {
-            // Non-UUID is likely an AniList ID — search() must return Astral UUIDs
+            console.warn('[astral] findChapters: not a UUID, returning [] (got AniList ID?)');
             return [];
         }
 
         try {
-            // First attempt: RSC header
             var res = await this._fetch(this.api + '/manga/' + seriesId, {
                 'RSC': '1'
             });
 
-            if (!res.ok) return [];
+            console.log('[astral] findChapters HTTP:', res.status);
+
+            if (!res.ok) {
+                console.warn('[astral] findChapters: HTTP error', res.status);
+                return [];
+            }
 
             var html = await res.text();
+            console.log('[astral] findChapters response length:', html.length);
+
+            // Check for Cloudflare block
+            if (html.indexOf('Just a moment') !== -1) {
+                console.error('[astral] findChapters: Cloudflare challenge page!');
+                return [];
+            }
+
             var parsed = this.parseRSC(html);
+            if (!parsed) {
+                console.warn('[astral] findChapters: RSC parse returned null');
+                return [];
+            }
 
-            if (!parsed) return [];
-
-            // Find the manga object first to get its internal ID
             var mangaObj = this._findBySignature(parsed, 'manga');
             var mangaData = mangaObj ? mangaObj.data : parsed;
-
-            // Find all chapter objects in the RSC tree
             var mangaInternalId = '';
             if (mangaData && mangaData.id) {
                 mangaInternalId = mangaData.id;
             }
 
             var chapterNodes = this._findAllChapters(parsed, mangaInternalId);
+            console.log('[astral] findChapters: found', chapterNodes.length, 'chapter nodes');
 
             if (chapterNodes.length === 0) {
-                // Retry with cache-busting parameter (mimics Tachiyomi retry logic)
+                console.log('[astral] findChapters: retrying with cache-bust...');
                 var retryUrl = this.api + '/manga/' + seriesId + '?_=' + Date.now();
                 var retryRes = await this._fetch(retryUrl, {
                     'RSC': '1',
@@ -293,11 +414,11 @@ class Provider {
                     var retryParsed = this.parseRSC(retryHtml);
                     if (retryParsed) {
                         chapterNodes = this._findAllChapters(retryParsed, mangaInternalId);
+                        console.log('[astral] findChapters: retry found', chapterNodes.length, 'chapter nodes');
                     }
                 }
             }
 
-            // Build chapter list
             var chapters = [];
             for (var i = 0; i < chapterNodes.length; i++) {
                 var ch = chapterNodes[i];
@@ -333,8 +454,10 @@ class Provider {
                 chapters[j].index = j;
             }
 
+            console.log('[astral] findChapters: returning', chapters.length, 'chapters');
             return chapters;
         } catch (e) {
+            console.error('[astral] findChapters exception:', e.message || e);
             return [];
         }
     }
@@ -342,35 +465,50 @@ class Provider {
     /**
      * Get page images for a chapter.
      *
-     * Strategy 1: Parse RSC data for image objects with link + orderId
+     * Strategy 1: RSC data for image objects with link + orderId
      * Strategy 2: Regex for s3: keys in the HTML
      * Strategy 3: <img alt~=^Page \d+> elements
      */
     async findChapterPages(chapterId) {
+        console.log('[astral] findChapterPages called with:', chapterId);
+
         try {
             var parts = chapterId.split('|');
-            if (parts.length !== 2) return [];
+            if (parts.length !== 2) {
+                console.warn('[astral] findChapterPages: invalid chapter ID format');
+                return [];
+            }
 
             var mangaId = parts[0];
             var chId = parts[1];
 
             var url = this.api + '/manga/' + mangaId + '/chapter/' + chId;
-            var res = await this._fetch(url);
+            console.log('[astral] findChapterPages URL:', url);
 
-            if (!res.ok) return [];
+            var res = await this._fetch(url);
+            console.log('[astral] findChapterPages HTTP:', res.status);
+
+            if (!res.ok) {
+                console.warn('[astral] findChapterPages: HTTP error', res.status);
+                return [];
+            }
 
             var html = await res.text();
+            console.log('[astral] findChapterPages response length:', html.length);
+
+            // Check for Cloudflare block
+            if (html.indexOf('Just a moment') !== -1) {
+                console.error('[astral] findChapterPages: Cloudflare challenge page!');
+                return [];
+            }
 
             // Strategy 1: Parse RSC data for RscImageDto objects
             var parsed = this.parseRSC(html);
             if (parsed) {
-                // Walk tree to find all image objects (link + orderId)
                 var images = this._findAllImages(parsed);
+                console.log('[astral] findChapterPages: RSC images found:', images.length);
                 if (images.length > 0) {
-                    // Sort by orderId
-                    images.sort(function (a, b) {
-                        return a.orderId - b.orderId;
-                    });
+                    images.sort(function (a, b) { return a.orderId - b.orderId; });
 
                     var pages = [];
                     for (var i = 0; i < images.length; i++) {
@@ -385,20 +523,19 @@ class Provider {
                         pages.push({
                             url: imgUrl,
                             index: i,
-                            headers: {
-                                'Referer': url,
-                            },
+                            headers: { 'Referer': url },
                         });
                     }
-                    if (pages.length > 0) return pages;
+                    console.log('[astral] findChapterPages: returning', pages.length, 'RSC pages');
+                    return pages;
                 }
             }
 
             // Strategy 2: Regex for s3: keys in the HTML
             var s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
             var s3Keys = html.match(s3KeyRegex);
+            console.log('[astral] findChapterPages: s3 regex matches:', s3Keys ? s3Keys.length : 0);
             if (s3Keys && s3Keys.length > 0) {
-                // Filter out cover thumbnails
                 var pageKeys = [];
                 for (var k = 0; k < s3Keys.length; k++) {
                     if (s3Keys[k].indexOf('/cover') === -1 && s3Keys[k].indexOf('cover-') === -1) {
@@ -412,17 +549,17 @@ class Provider {
                     pages2.push({
                         url: this.resolveImage(keys[p]),
                         index: p,
-                        headers: {
-                            'Referer': url,
-                        },
+                        headers: { 'Referer': url },
                     });
                 }
+                console.log('[astral] findChapterPages: returning', pages2.length, 's3 pages');
                 return pages2;
             }
 
             // Strategy 3: <img alt~=^Page \d+> elements
             var imgRegex = /<img[^>]*alt="Page \d+"[^>]*src="([^"]+)"/gi;
             var imgMatches = html.match(imgRegex);
+            console.log('[astral] findChapterPages: img tag matches:', imgMatches ? imgMatches.length : 0);
             if (imgMatches && imgMatches.length > 0) {
                 var srcRegex = /src="([^"]+)"/i;
                 var pages3 = [];
@@ -437,50 +574,20 @@ class Provider {
                         pages3.push({
                             url: src,
                             index: idx,
-                            headers: {
-                                'Referer': url,
-                            },
+                            headers: { 'Referer': url },
                         });
                         idx++;
                     }
                 }
+                console.log('[astral] findChapterPages: returning', pages3.length, 'img pages');
                 return pages3;
             }
 
+            console.warn('[astral] findChapterPages: no pages found with any strategy');
             return [];
         } catch (e) {
+            console.error('[astral] findChapterPages exception:', e.message || e);
             return [];
         }
-    }
-
-    /**
-     * Walk RSC tree to find all image objects (link + orderId).
-     */
-    _findAllImages(node, found) {
-        if (!found) found = [];
-        if (!node || typeof node !== 'object') return found;
-
-        if (typeof node.link === 'string' && typeof node.orderId === 'number') {
-            var dup = false;
-            for (var i = 0; i < found.length; i++) {
-                if (found[i].link === node.link) { dup = true; break; }
-            }
-            if (!dup) found.push({ link: node.link, orderId: node.orderId });
-        }
-
-        if (Array.isArray(node)) {
-            for (var j = 0; j < node.length; j++) {
-                this._findAllImages(node[j], found);
-            }
-        } else if (typeof node === 'object') {
-            var keys = Object.keys(node);
-            for (var k = 0; k < keys.length; k++) {
-                var key = keys[k];
-                if (key === '__proto__' || key === 'constructor') continue;
-                this._findAllImages(node[key], found);
-            }
-        }
-
-        return found;
     }
 }
