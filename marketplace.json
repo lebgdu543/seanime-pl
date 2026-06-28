@@ -1,0 +1,11 @@
+{
+  "id": "astral-bridge",
+  "name": "Astral-Manga Bridge",
+  "description": "Cloudflare bypass companion for the Astral-Manga.fr provider. Required for the provider to work.",
+  "author": "eren",
+  "manifestURI": "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/plugins/astral-bridge/manifest.json",
+  "icon": "",
+  "type": "plugin",
+  "language": "typescript",
+  "lang": "en"
+}
