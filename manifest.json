@@ -1,0 +1,12 @@
+{
+  "id": "astral-manga-provider",
+  "name": "Astral Manga",
+  "description": "Manga provider for astral-manga.fr — lecture de scans français directement dans Seanime.",
+  "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/manifest.json",
+  "version": "0.1.0",
+  "author": "lebgdu543",
+  "type": "manga-provider",
+  "language": "typescript",
+  "lang": "fr",
+  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/provider.js"
+}
