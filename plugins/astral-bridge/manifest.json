@@ -8,8 +8,8 @@
   "author": "eren",
   "icon": "",
   "lang": "en",
-  "payloadURI": "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/plugins/astral-bridge/code.ts",
-  "manifestURI": "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/plugins/astral-bridge/manifest.json",
+  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/refs/heads/main/plugins/astral-bridge/code.ts",
+  "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/refs/heads/main/plugins/astral-bridge/manifest.json",
   "plugin": {
     "version": "1",
     "permissions": {
