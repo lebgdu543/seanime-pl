@@ -10,7 +10,7 @@ $ui.register(function(ctx) {
     var STORE_KEY = 'astral-manga-cookies';
     var REFRESH_MS = 25 * 60 * 1000;
 
-    function refreshCookies() {
+    var refreshCookies = function() {
         return ctx.fetch(API_BASE + '/', {
             noCloudflareBypass: false,
             headers: {

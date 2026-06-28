@@ -1,7 +1,7 @@
 {
   "id": "astral-bridge",
   "name": "Astral-Manga Bridge",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "language": "typescript",
   "type": "plugin",
   "description": "Solves Cloudflare challenge for astral-manga.fr manga provider",
@@ -13,7 +13,13 @@
   "plugin": {
     "version": "1",
     "permissions": {
-      "scopes": ["storage"]
+      "scopes": ["storage"],
+      "allow": {
+        "networkAccess": {
+          "allowedDomains": ["astral-manga.fr", "*.astral-manga.fr"],
+          "reasoning": "Required to fetch Cloudflare clearance cookies"
+        }
+      }
     }
   }
 }
