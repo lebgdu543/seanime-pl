@@ -2,7 +2,7 @@
     "id": "astral-manga",
     "name": "Astral-Manga",
     "description": "French manga/manhwa scanlation provider for Astral-Manga.fr. Parses Next.js RSC self.__next_f.push chunks from HTML.",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "type": "manga",
     "author": "lebgdu543",
     "language": "fr",
