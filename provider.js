@@ -10,11 +10,17 @@
  *   Manga:   GET /manga/{urlId}  (RSC: 1 header for chapter list)
  *   Chapter: GET /manga/{urlId}/chapter/{chapterUuid}
  *   Images:  GET /api/s3/presign-get?key=...
+ *
+ * Cloudflare bypass: the site is behind Cloudflare. We warm up the session
+ * by visiting the homepage first, which triggers the JS challenge in Electron's
+ * Chromium engine and sets the cf_clearance cookie for all subsequent requests.
  */
 
 class Provider {
     constructor() {
         this.api = 'https://astral-manga.fr';
+        this._warmedUp = false;
+        this._warmingUp = null;
     }
 
     getSettings() {
@@ -22,6 +28,65 @@ class Provider {
             supportsMultiLanguage: false,
             supportsMultiScanlator: false,
         };
+    }
+
+    // =================================================================
+    //  Cloudflare warmup
+    // =================================================================
+
+    /**
+     * Visit the homepage to trigger Cloudflare's JS challenge.
+     * Electron's Chromium engine solves it and stores the cf_clearance cookie.
+     * Subsequent API calls reuse that cookie and pass through.
+     */
+    async _warmup() {
+        if (this._warmedUp) return;
+        if (this._warmingUp) return this._warmingUp;
+
+        this._warmingUp = (async () => {
+            try {
+                // Step 1: hit the homepage to get the Cloudflare challenge
+                var homeRes = await fetch(this.api + '/', {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
+                    },
+                });
+
+                var homeText = await homeRes.text();
+                var status = homeRes.status;
+
+                // If we got a Cloudflare challenge page, wait for it to resolve
+                if (homeText.indexOf('Just a moment') !== -1 || homeText.indexOf('challenge-platform') !== -1) {
+                    // The challenge JS runs automatically in Electron. Wait a bit.
+                    await new Promise(function (resolve) {
+                        setTimeout(resolve, 3000);
+                    });
+
+                    // Retry the homepage
+                    var retryRes = await fetch(this.api + '/', {
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
+                        },
+                    });
+                    var retryText = await retryRes.text();
+                    if (retryText.indexOf('Just a moment') !== -1) {
+                        // Still blocked after retry
+                    } else {
+                        // Challenge solved
+                    }
+                }
+                // If we got through (even if 404/500), cookies are set
+            } catch (e) {
+                // Ignore warmup errors — we'll still try the API
+            }
+            this._warmedUp = true;
+        })();
+
+        return this._warmingUp;
     }
 
     // =================================================================
@@ -227,12 +292,13 @@ class Provider {
      */
     async search(opts) {
         var q = (opts.query || '').trim();
-        console.log('[astral] search() called with query:', JSON.stringify(q));
 
         if (!q) {
-            console.log('[astral] search: empty query, returning []');
             return [];
         }
+
+        // Warm up Cloudflare session first
+        await this._warmup();
 
         var searchUrl = this.api + '/api/mangas' +
             '?query=' + encodeURIComponent(q) +
@@ -243,36 +309,32 @@ class Provider {
             '&includeMode=and' +
             '&excludeMode=or';
 
-        console.log('[astral] search URL:', searchUrl);
-
         try {
             var res = await this._fetch(searchUrl);
-            console.log('[astral] search HTTP status:', res.status);
 
             if (!res.ok) {
-                console.warn('[astral] search: HTTP error', res.status);
                 return [];
             }
 
             var text = await res.text();
-            console.log('[astral] search response length:', text.length);
 
-            // Check for Cloudflare block
+            // Check for Cloudflare block (even after warmup)
             if (text.indexOf('Just a moment') !== -1) {
-                console.error('[astral] search: Cloudflare challenge page returned!');
-                return [];
+                // Retry warmup once
+                this._warmedUp = false;
+                await this._warmup();
+                var retryRes = await this._fetch(searchUrl);
+                if (!retryRes.ok) return [];
+                text = await retryRes.text();
+                if (text.indexOf('Just a moment') !== -1) return [];
             }
 
             // Check for HTML (RSC or regular page) instead of JSON
             if (text.indexOf('{') !== 0 && text.indexOf('[') !== 0) {
-                console.warn('[astral] search: response is not JSON, trying RSC parse...');
                 // Try RSC parsing as fallback
                 var rscParsed = this.parseRSC(text);
                 if (rscParsed) {
-                    console.log('[astral] search: RSC parsed successfully, walking tree...');
-                    // Walk the tree for manga-like objects
                     var foundMangas = this._findAllMangas(rscParsed);
-                    console.log('[astral] search: found', foundMangas.length, 'mangas in RSC tree');
                     if (foundMangas.length > 0) {
                         return foundMangas;
                     }
@@ -281,11 +343,8 @@ class Provider {
             }
 
             var json = JSON.parse(text);
-            console.log('[astral] search JSON keys:', Object.keys(json).join(', '));
-            console.log('[astral] search total:', json.total, 'mangas:', json.mangas ? json.mangas.length : 'missing');
 
             if (!json.mangas || !Array.isArray(json.mangas)) {
-                console.warn('[astral] search: no mangas array in response');
                 return [];
             }
 
@@ -304,10 +363,8 @@ class Provider {
                 });
             }
 
-            console.log('[astral] search: returning', results.length, 'results');
             return results;
         } catch (e) {
-            console.error('[astral] search exception:', e.message || e);
             return [];
         }
     }
@@ -357,37 +414,31 @@ class Provider {
      * Get chapters for a manga via RSC header.
      */
     async findChapters(seriesId) {
-        console.log('[astral] findChapters called with:', seriesId);
-
         if (!this.isUUID(seriesId)) {
-            console.warn('[astral] findChapters: not a UUID, returning [] (got AniList ID?)');
             return [];
         }
+
+        // Warm up Cloudflare session first
+        await this._warmup();
 
         try {
             var res = await this._fetch(this.api + '/manga/' + seriesId, {
                 'RSC': '1'
             });
 
-            console.log('[astral] findChapters HTTP:', res.status);
-
             if (!res.ok) {
-                console.warn('[astral] findChapters: HTTP error', res.status);
                 return [];
             }
 
             var html = await res.text();
-            console.log('[astral] findChapters response length:', html.length);
 
             // Check for Cloudflare block
             if (html.indexOf('Just a moment') !== -1) {
-                console.error('[astral] findChapters: Cloudflare challenge page!');
                 return [];
             }
 
             var parsed = this.parseRSC(html);
             if (!parsed) {
-                console.warn('[astral] findChapters: RSC parse returned null');
                 return [];
             }
 
@@ -399,10 +450,9 @@ class Provider {
             }
 
             var chapterNodes = this._findAllChapters(parsed, mangaInternalId);
-            console.log('[astral] findChapters: found', chapterNodes.length, 'chapter nodes');
 
             if (chapterNodes.length === 0) {
-                console.log('[astral] findChapters: retrying with cache-bust...');
+                // Retry with cache-bust
                 var retryUrl = this.api + '/manga/' + seriesId + '?_=' + Date.now();
                 var retryRes = await this._fetch(retryUrl, {
                     'RSC': '1',
@@ -414,7 +464,6 @@ class Provider {
                     var retryParsed = this.parseRSC(retryHtml);
                     if (retryParsed) {
                         chapterNodes = this._findAllChapters(retryParsed, mangaInternalId);
-                        console.log('[astral] findChapters: retry found', chapterNodes.length, 'chapter nodes');
                     }
                 }
             }
@@ -454,10 +503,8 @@ class Provider {
                 chapters[j].index = j;
             }
 
-            console.log('[astral] findChapters: returning', chapters.length, 'chapters');
             return chapters;
         } catch (e) {
-            console.error('[astral] findChapters exception:', e.message || e);
             return [];
         }
     }
@@ -470,12 +517,12 @@ class Provider {
      * Strategy 3: <img alt~=^Page \d+> elements
      */
     async findChapterPages(chapterId) {
-        console.log('[astral] findChapterPages called with:', chapterId);
+        // Warm up Cloudflare session first
+        await this._warmup();
 
         try {
             var parts = chapterId.split('|');
             if (parts.length !== 2) {
-                console.warn('[astral] findChapterPages: invalid chapter ID format');
                 return [];
             }
 
@@ -483,22 +530,17 @@ class Provider {
             var chId = parts[1];
 
             var url = this.api + '/manga/' + mangaId + '/chapter/' + chId;
-            console.log('[astral] findChapterPages URL:', url);
 
             var res = await this._fetch(url);
-            console.log('[astral] findChapterPages HTTP:', res.status);
 
             if (!res.ok) {
-                console.warn('[astral] findChapterPages: HTTP error', res.status);
                 return [];
             }
 
             var html = await res.text();
-            console.log('[astral] findChapterPages response length:', html.length);
 
             // Check for Cloudflare block
             if (html.indexOf('Just a moment') !== -1) {
-                console.error('[astral] findChapterPages: Cloudflare challenge page!');
                 return [];
             }
 
@@ -506,7 +548,6 @@ class Provider {
             var parsed = this.parseRSC(html);
             if (parsed) {
                 var images = this._findAllImages(parsed);
-                console.log('[astral] findChapterPages: RSC images found:', images.length);
                 if (images.length > 0) {
                     images.sort(function (a, b) { return a.orderId - b.orderId; });
 
@@ -526,7 +567,6 @@ class Provider {
                             headers: { 'Referer': url },
                         });
                     }
-                    console.log('[astral] findChapterPages: returning', pages.length, 'RSC pages');
                     return pages;
                 }
             }
@@ -534,7 +574,6 @@ class Provider {
             // Strategy 2: Regex for s3: keys in the HTML
             var s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
             var s3Keys = html.match(s3KeyRegex);
-            console.log('[astral] findChapterPages: s3 regex matches:', s3Keys ? s3Keys.length : 0);
             if (s3Keys && s3Keys.length > 0) {
                 var pageKeys = [];
                 for (var k = 0; k < s3Keys.length; k++) {
@@ -552,14 +591,12 @@ class Provider {
                         headers: { 'Referer': url },
                     });
                 }
-                console.log('[astral] findChapterPages: returning', pages2.length, 's3 pages');
                 return pages2;
             }
 
             // Strategy 3: <img alt~=^Page \d+> elements
             var imgRegex = /<img[^>]*alt="Page \d+"[^>]*src="([^"]+)"/gi;
             var imgMatches = html.match(imgRegex);
-            console.log('[astral] findChapterPages: img tag matches:', imgMatches ? imgMatches.length : 0);
             if (imgMatches && imgMatches.length > 0) {
                 var srcRegex = /src="([^"]+)"/i;
                 var pages3 = [];
@@ -579,14 +616,11 @@ class Provider {
                         idx++;
                     }
                 }
-                console.log('[astral] findChapterPages: returning', pages3.length, 'img pages');
                 return pages3;
             }
 
-            console.warn('[astral] findChapterPages: no pages found with any strategy');
             return [];
         } catch (e) {
-            console.error('[astral] findChapterPages exception:', e.message || e);
             return [];
         }
     }
