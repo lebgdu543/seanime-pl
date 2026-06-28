@@ -36,8 +36,12 @@ class Provider {
 
     /**
      * Visit the homepage to trigger Cloudflare's JS challenge.
-     * Electron's Chromium engine solves it and stores the cf_clearance cookie.
-     * Subsequent API calls reuse that cookie and pass through.
+     * In Electron, the JS challenge runs in the Chromium engine and sets
+     * cf_clearance. If fetch() shares the Electron cookie jar, subsequent
+     * API calls will pass through Cloudflare.
+     *
+     * If fetch() does NOT share cookies (Goja polyfill), this won't help
+     * and we fall back to scraping the search page HTML.
      */
     async _warmup() {
         if (this._warmedUp) return;
@@ -45,7 +49,9 @@ class Provider {
 
         this._warmingUp = (async () => {
             try {
-                // Step 1: hit the homepage to get the Cloudflare challenge
+                console.log('[astral] Warmup: visiting homepage to solve Cloudflare challenge...');
+
+                // Step 1: hit the homepage
                 var homeRes = await fetch(this.api + '/', {
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -54,17 +60,22 @@ class Provider {
                     },
                 });
 
+                console.log('[astral] Warmup: homepage status ' + homeRes.status);
                 var homeText = await homeRes.text();
-                var status = homeRes.status;
 
-                // If we got a Cloudflare challenge page, wait for it to resolve
-                if (homeText.indexOf('Just a moment') !== -1 || homeText.indexOf('challenge-platform') !== -1) {
-                    // The challenge JS runs automatically in Electron. Wait a bit.
+                var isChallenge = homeText.indexOf('Just a moment') !== -1 ||
+                                  homeText.indexOf('challenge-platform') !== -1 ||
+                                  homeText.indexOf('cf-browser-verification') !== -1;
+
+                if (isChallenge) {
+                    console.log('[astral] Warmup: Cloudflare challenge detected, waiting 5s for JS to solve...');
+                    // The challenge JS runs automatically in Electron's Chromium.
+                    // Give it time to complete.
                     await new Promise(function (resolve) {
-                        setTimeout(resolve, 3000);
+                        setTimeout(resolve, 5000);
                     });
 
-                    // Retry the homepage
+                    // Retry — if cookies are shared, this should go through
                     var retryRes = await fetch(this.api + '/', {
                         headers: {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -73,15 +84,22 @@ class Provider {
                         },
                     });
                     var retryText = await retryRes.text();
-                    if (retryText.indexOf('Just a moment') !== -1) {
-                        // Still blocked after retry
+                    console.log('[astral] Warmup: retry status ' + retryRes.status);
+
+                    if (retryText.indexOf('Just a moment') !== -1 || retryRes.status === 403) {
+                        console.warn('[astral] Warmup: STILL BLOCKED after retry — fetch() may not share Electron cookies');
                     } else {
-                        // Challenge solved
+                        console.log('[astral] Warmup: challenge solved ✓');
+                        this._cfCookiesWork = true;
                     }
+                } else if (homeRes.status === 200 && homeText.indexOf('<html') !== -1) {
+                    console.log('[astral] Warmup: got homepage directly (no challenge) ✓');
+                    this._cfCookiesWork = true;
+                } else {
+                    console.log('[astral] Warmup: homepage returned status ' + homeRes.status + ' (unexpected, but continuing)');
                 }
-                // If we got through (even if 404/500), cookies are set
             } catch (e) {
-                // Ignore warmup errors — we'll still try the API
+                console.warn('[astral] Warmup: error — ' + (e.message || e));
             }
             this._warmedUp = true;
         })();
