@@ -5,15 +5,11 @@
  *
  * Site: French manga/manhwa scanlation (Next.js App Router)
  *
- * URL structure:
- *   Manga:   /manga/{mangaUuid}
- *   Chapter: /manga/{mangaUuid}/chapter/{chapterUuid}
- *   Images:  /api/s3/presign-get?key=...
- *
- * The site embeds Next.js RSC data in self.__next_f.push([1,"..."])
- * chunks within HTML script tags. We parse those to extract manga
- * metadata and chapter data. RSC-only requests (?_rsc=..., RSC: 1)
- * return 403 so we always fetch the full HTML page.
+ * API endpoints (discovered from working Tachiyomi extension):
+ *   Search:  GET /api/mangas?query=...&page=1&pageSize=20
+ *   Manga:   GET /manga/{urlId}  (RSC: 1 header for details)
+ *   Chapter: GET /manga/{urlId}/chapter/{chapterUuid}
+ *   Images:  GET /api/s3/presign-get?key=...
  */
 
 class Provider {
@@ -34,15 +30,43 @@ class Provider {
     //  Helpers
     // =================================================================
 
+    /**
+     * Resolve an S3 key to a presigned URL.
+     * Handles: "s3:uploads/projects/...", "uploads/projects/...", or already-presigned URLs
+     */
     resolveImage(s3Key) {
-        var raw = s3Key.replace(/^s3:/, '');
+        var raw = s3Key;
+        if (raw.indexOf('s3:') === 0) {
+            raw = raw.substring(3);
+        }
         return this.api + '/api/s3/presign-get?key=' + encodeURIComponent(raw);
+    }
+
+    /**
+     * Fetch helper with browser-mimicking headers to pass Cloudflare.
+     */
+    async _fetch(url, extraHeaders) {
+        var headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/html, */*',
+            'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': this.api + '/',
+        };
+
+        if (extraHeaders) {
+            var keys = Object.keys(extraHeaders);
+            for (var i = 0; i < keys.length; i++) {
+                headers[keys[i]] = extraHeaders[keys[i]];
+            }
+        }
+
+        return fetch(url, { headers: headers });
     }
 
     /**
      * Parse React Server Components wire format from HTML.
      * Extracts all self.__next_f.push([1,"..."]) chunks, unescapes them,
-     * and tries to parse a JSON tree with manga/chapter data.
+     * and tries to parse a JSON tree.
      */
     parseRSC(text) {
         var pushRegex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
@@ -61,8 +85,9 @@ class Provider {
         try {
             return JSON.parse(combined);
         } catch (e) {
-            var lines = combined.split('\n').filter(Boolean);
+            var lines = combined.split('\n');
             for (var i = 0; i < lines.length; i++) {
+                if (!lines[i]) continue;
                 try {
                     var obj = JSON.parse(lines[i]);
                     if (typeof obj === 'object' && obj !== null) {
@@ -78,23 +103,28 @@ class Provider {
 
     /**
      * Walk a parsed object tree looking for manga or chapter data.
-     * Manga: has "title" string AND "chapters" array
-     * Chapter: has "id" string AND "images" array (but NOT "chapters")
      */
     _findBySignature(node, type) {
         if (!node || typeof node !== 'object') return null;
 
-        // Manga signature
+        // Manga signature: has "title" string AND "chapters" array
         if (!type || type === 'manga') {
             if (typeof node.title === 'string' && Array.isArray(node.chapters)) {
                 return { type: 'manga', data: node };
             }
         }
 
-        // Chapter signature
+        // Chapter signature: has "id" string AND "images" array (but NOT "chapters")
         if (!type || type === 'chapter') {
             if (typeof node.id === 'string' && Array.isArray(node.images) && !Array.isArray(node.chapters)) {
                 return { type: 'chapter', data: node };
+            }
+        }
+
+        // RSC image with orderId (for image extraction)
+        if (type === 'image') {
+            if (typeof node.link === 'string' && typeof node.orderId === 'number') {
+                return { type: 'image', data: node };
             }
         }
 
@@ -117,146 +147,94 @@ class Provider {
         return null;
     }
 
-    /** Fetch the manga page HTML and extract RSC manga data */
-    async fetchMangaData(mangaId) {
-        var url = this.api + '/manga/' + mangaId;
+    /**
+     * Walk parsed RSC data to find ALL chapter objects (not just the first).
+     * Returns array of { id, orderId, publishDate, mangaId }.
+     */
+    _findAllChapters(node, mangaId, found) {
+        if (!found) found = [];
+        if (!node || typeof node !== 'object') return found;
 
-        var res = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-            },
-        });
-
-        if (!res.ok) {
-            throw new Error('HTTP ' + res.status + ' for ' + mangaId);
-        }
-
-        var html = await res.text();
-        var parsed = this.parseRSC(html);
-
-        if (!parsed) {
-            throw new Error('No RSC data found in HTML for ' + mangaId);
-        }
-
-        var manga = this._findBySignature(parsed, 'manga');
-        if (manga) return manga.data;
-
-        if (parsed.title && Array.isArray(parsed.chapters)) {
-            return parsed;
-        }
-
-        throw new Error('No manga data found in RSC for ' + mangaId);
-    }
-
-    /** Fetch chapter page HTML and extract S3 image keys */
-    async fetchChapterData(mangaId, chapterId) {
-        var url = this.api + '/manga/' + mangaId + '/chapter/' + chapterId;
-
-        var res = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-            },
-        });
-
-        if (!res.ok) return null;
-
-        var html = await res.text();
-
-        // Strategy 1: Extract S3 keys with regex
-        var s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
-        var s3Keys = html.match(s3KeyRegex);
-        if (s3Keys && s3Keys.length > 0) {
-            var pageKeys = s3Keys.filter(function (k) {
-                return k.indexOf('/cover') === -1 && k.indexOf('cover-') === -1;
-            });
-            return pageKeys.length > 0 ? pageKeys : s3Keys;
-        }
-
-        // Strategy 2: Parse RSC and find chapter object with images
-        var parsed = this.parseRSC(html);
-        if (parsed) {
-            var chapter = this._findBySignature(parsed, 'chapter');
-            if (chapter && chapter.data && chapter.data.images) {
-                return chapter.data.images.map(function (img) {
-                    if (typeof img === 'string') return img;
-                    return img.link || img.key || img.url || img;
-                });
+        if (typeof node.id === 'string' && typeof node.orderId === 'number' && typeof node.mangaId === 'string') {
+            if (node.mangaId === mangaId || !mangaId) {
+                // Deduplicate by id
+                var dup = false;
+                for (var i = 0; i < found.length; i++) {
+                    if (found[i].id === node.id) { dup = true; break; }
+                }
+                if (!dup) found.push(node);
             }
         }
 
-        return null;
+        if (Array.isArray(node)) {
+            for (var j = 0; j < node.length; j++) {
+                this._findAllChapters(node[j], mangaId, found);
+            }
+        } else if (typeof node === 'object') {
+            var keys = Object.keys(node);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === '__proto__' || key === 'constructor') continue;
+                this._findAllChapters(node[key], mangaId, found);
+            }
+        }
+
+        return found;
+    }
+
+    /**
+     * Check if a string looks like an Astral UUID (36-char hex with dashes).
+     * Non-UUID values are likely AniList IDs.
+     */
+    isUUID(str) {
+        return str && str.length === 36 && str.indexOf('-') !== -1;
     }
 
     // =================================================================
     //  Provider Interface
     // =================================================================
 
+    /**
+     * Search for manga via the /api/mangas REST endpoint.
+     *
+     * The API returns JSON:
+     *   { mangas: [{ id, title, urlId, cover: { image: { link } } }], total: N }
+     */
     async search(opts) {
         var q = (opts.query || '').trim();
         if (!q) return [];
 
-        var searchUrl = this.api + '/search?q=' + encodeURIComponent(q);
+        var searchUrl = this.api + '/api/mangas' +
+            '?query=' + encodeURIComponent(q) +
+            '&page=1' +
+            '&pageSize=12' +
+            '&sortBy=title' +
+            '&sortOrder=asc' +
+            '&includeMode=and' +
+            '&excludeMode=or';
 
         try {
-            var res = await fetch(searchUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-            });
+            var res = await this._fetch(searchUrl);
 
             if (!res.ok) return [];
 
-            var html = await res.text();
+            var json = await res.json();
 
-            // Try RSC parsing first (search page or direct match)
-            var parsed = this.parseRSC(html);
-            if (parsed) {
-                var manga = this._findBySignature(parsed, 'manga');
-                if (manga && manga.data) {
-                    var d = manga.data;
-                    var img;
-                    if (d.cover && d.cover.image && d.cover.image.link) {
-                        img = this.resolveImage(d.cover.image.link);
-                    } else if (d.image) {
-                        img = this.resolveImage(d.image);
-                    }
-                    return [{
-                        id: d.id || '',
-                        title: d.title || '',
-                        image: img,
-                    }];
-                }
-                if (parsed.title && Array.isArray(parsed.chapters)) {
-                    var img2;
-                    if (parsed.cover && parsed.cover.image && parsed.cover.image.link) {
-                        img2 = this.resolveImage(parsed.cover.image.link);
-                    }
-                    return [{
-                        id: parsed.id || '',
-                        title: parsed.title,
-                        image: img2,
-                    }];
-                }
-            }
+            if (!json || !json.mangas || !Array.isArray(json.mangas)) return [];
 
-            // Fallback: extract manga links from search results HTML
-            var linkRegex = /\/manga\/([a-f0-9-]{36})[^"]*"[^>]*>([^<]+)</gi;
             var results = [];
-            var seen = {};
-            var match;
-            while ((match = linkRegex.exec(html)) !== null) {
-                var id = match[1];
-                var title = match[2].trim();
-                if (!seen[id] && title.length > 1) {
-                    seen[id] = true;
-                    results.push({ id: id, title: title });
+            for (var i = 0; i < json.mangas.length; i++) {
+                var m = json.mangas[i];
+                var img;
+                if (m.cover && m.cover.image && m.cover.image.link) {
+                    img = this.resolveImage(m.cover.image.link);
                 }
+
+                results.push({
+                    id: m.urlId || m.id || '',
+                    title: m.title || '',
+                    image: img,
+                });
             }
 
             return results;
@@ -265,32 +243,94 @@ class Provider {
         }
     }
 
+    /**
+     * Get chapters for a manga.
+     *
+     * Uses RSC: 1 header to get structured data from the manga page,
+     * then extracts chapter objects from the React tree.
+     */
     async findChapters(seriesId) {
+        if (!this.isUUID(seriesId)) {
+            // Non-UUID is likely an AniList ID — search() must return Astral UUIDs
+            return [];
+        }
+
         try {
-            var data = await this.fetchMangaData(seriesId);
-            var chapters = [];
+            // First attempt: RSC header
+            var res = await this._fetch(this.api + '/manga/' + seriesId, {
+                'RSC': '1'
+            });
 
-            if (data.chapters && Array.isArray(data.chapters)) {
-                for (var i = 0; i < data.chapters.length; i++) {
-                    var ch = data.chapters[i];
-                    if (!ch.id) continue;
+            if (!res.ok) return [];
 
-                    var num = ch.number || ch.chapter;
-                    if (num === undefined || num === null) {
-                        num = i;
+            var html = await res.text();
+            var parsed = this.parseRSC(html);
+
+            if (!parsed) return [];
+
+            // Find the manga object first to get its internal ID
+            var mangaObj = this._findBySignature(parsed, 'manga');
+            var mangaData = mangaObj ? mangaObj.data : parsed;
+
+            // Find all chapter objects in the RSC tree
+            var mangaInternalId = '';
+            if (mangaData && mangaData.id) {
+                mangaInternalId = mangaData.id;
+            }
+
+            var chapterNodes = this._findAllChapters(parsed, mangaInternalId);
+
+            if (chapterNodes.length === 0) {
+                // Retry with cache-busting parameter (mimics Tachiyomi retry logic)
+                var retryUrl = this.api + '/manga/' + seriesId + '?_=' + Date.now();
+                var retryRes = await this._fetch(retryUrl, {
+                    'RSC': '1',
+                    'Cache-Control': 'no-cache'
+                });
+
+                if (retryRes.ok) {
+                    var retryHtml = await retryRes.text();
+                    var retryParsed = this.parseRSC(retryHtml);
+                    if (retryParsed) {
+                        chapterNodes = this._findAllChapters(retryParsed, mangaInternalId);
                     }
-
-                    // Composite ID: mangaUuid|chapterUuid
-                    var compositeId = seriesId + '|' + ch.id;
-
-                    chapters.push({
-                        id: compositeId,
-                        url: this.api + '/manga/' + seriesId + '/chapter/' + ch.id,
-                        title: ch.title || ('Chapter ' + num),
-                        chapter: String(num),
-                        index: i,
-                    });
                 }
+            }
+
+            // Build chapter list
+            var chapters = [];
+            for (var i = 0; i < chapterNodes.length; i++) {
+                var ch = chapterNodes[i];
+                var num = ch.orderId;
+                var numStr;
+                if (num % 1 === 0) {
+                    numStr = String(Math.floor(num));
+                } else {
+                    numStr = String(num);
+                }
+
+                // Composite ID: urlId|chapterUuid
+                var compositeId = seriesId + '|' + ch.id;
+
+                chapters.push({
+                    id: compositeId,
+                    url: '/manga/' + seriesId + '/chapter/' + ch.id,
+                    title: 'Chapitre ' + numStr,
+                    chapter: numStr,
+                    index: i,
+                });
+            }
+
+            // Sort by chapter number descending (newest first)
+            chapters.sort(function (a, b) {
+                var aNum = parseFloat(a.chapter);
+                var bNum = parseFloat(b.chapter);
+                return bNum - aNum;
+            });
+
+            // Re-index after sort
+            for (var j = 0; j < chapters.length; j++) {
+                chapters[j].index = j;
             }
 
             return chapters;
@@ -299,38 +339,148 @@ class Provider {
         }
     }
 
+    /**
+     * Get page images for a chapter.
+     *
+     * Strategy 1: Parse RSC data for image objects with link + orderId
+     * Strategy 2: Regex for s3: keys in the HTML
+     * Strategy 3: <img alt~=^Page \d+> elements
+     */
     async findChapterPages(chapterId) {
         try {
-            // Split composite ID: mangaUuid|chapterUuid
             var parts = chapterId.split('|');
             if (parts.length !== 2) return [];
 
             var mangaId = parts[0];
             var chId = parts[1];
 
-            var keys = await this.fetchChapterData(mangaId, chId);
-            if (!keys || keys.length === 0) return [];
+            var url = this.api + '/manga/' + mangaId + '/chapter/' + chId;
+            var res = await this._fetch(url);
 
-            var pages = [];
-            for (var i = 0; i < keys.length; i++) {
-                var url;
-                if (typeof keys[i] === 'string') {
-                    url = this.resolveImage(keys[i]);
-                } else {
-                    url = this.resolveImage(keys[i].link || keys[i].key || keys[i].url || keys[i]);
+            if (!res.ok) return [];
+
+            var html = await res.text();
+
+            // Strategy 1: Parse RSC data for RscImageDto objects
+            var parsed = this.parseRSC(html);
+            if (parsed) {
+                // Walk tree to find all image objects (link + orderId)
+                var images = this._findAllImages(parsed);
+                if (images.length > 0) {
+                    // Sort by orderId
+                    images.sort(function (a, b) {
+                        return a.orderId - b.orderId;
+                    });
+
+                    var pages = [];
+                    for (var i = 0; i < images.length; i++) {
+                        var imgUrl;
+                        if (images[i].link.indexOf('s3:') === 0) {
+                            imgUrl = this.resolveImage(images[i].link);
+                        } else if (images[i].link.indexOf('http') === 0) {
+                            imgUrl = images[i].link;
+                        } else {
+                            imgUrl = this.api + images[i].link;
+                        }
+                        pages.push({
+                            url: imgUrl,
+                            index: i,
+                            headers: {
+                                'Referer': url,
+                            },
+                        });
+                    }
+                    if (pages.length > 0) return pages;
                 }
-                pages.push({
-                    url: url,
-                    index: i,
-                    headers: {
-                        'Referer': this.api + '/manga/' + mangaId + '/chapter/' + chId,
-                    },
-                });
             }
 
-            return pages;
+            // Strategy 2: Regex for s3: keys in the HTML
+            var s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
+            var s3Keys = html.match(s3KeyRegex);
+            if (s3Keys && s3Keys.length > 0) {
+                // Filter out cover thumbnails
+                var pageKeys = [];
+                for (var k = 0; k < s3Keys.length; k++) {
+                    if (s3Keys[k].indexOf('/cover') === -1 && s3Keys[k].indexOf('cover-') === -1) {
+                        pageKeys.push(s3Keys[k]);
+                    }
+                }
+                var keys = pageKeys.length > 0 ? pageKeys : s3Keys;
+
+                var pages2 = [];
+                for (var p = 0; p < keys.length; p++) {
+                    pages2.push({
+                        url: this.resolveImage(keys[p]),
+                        index: p,
+                        headers: {
+                            'Referer': url,
+                        },
+                    });
+                }
+                return pages2;
+            }
+
+            // Strategy 3: <img alt~=^Page \d+> elements
+            var imgRegex = /<img[^>]*alt="Page \d+"[^>]*src="([^"]+)"/gi;
+            var imgMatches = html.match(imgRegex);
+            if (imgMatches && imgMatches.length > 0) {
+                var srcRegex = /src="([^"]+)"/i;
+                var pages3 = [];
+                var idx = 0;
+                for (var m = 0; m < imgMatches.length; m++) {
+                    var srcMatch = srcRegex.exec(imgMatches[m]);
+                    if (srcMatch && srcMatch[1]) {
+                        var src = srcMatch[1];
+                        if (src.indexOf('http') !== 0) {
+                            src = this.api + src;
+                        }
+                        pages3.push({
+                            url: src,
+                            index: idx,
+                            headers: {
+                                'Referer': url,
+                            },
+                        });
+                        idx++;
+                    }
+                }
+                return pages3;
+            }
+
+            return [];
         } catch (e) {
             return [];
         }
+    }
+
+    /**
+     * Walk RSC tree to find all image objects (link + orderId).
+     */
+    _findAllImages(node, found) {
+        if (!found) found = [];
+        if (!node || typeof node !== 'object') return found;
+
+        if (typeof node.link === 'string' && typeof node.orderId === 'number') {
+            var dup = false;
+            for (var i = 0; i < found.length; i++) {
+                if (found[i].link === node.link) { dup = true; break; }
+            }
+            if (!dup) found.push({ link: node.link, orderId: node.orderId });
+        }
+
+        if (Array.isArray(node)) {
+            for (var j = 0; j < node.length; j++) {
+                this._findAllImages(node[j], found);
+            }
+        } else if (typeof node === 'object') {
+            var keys = Object.keys(node);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === '__proto__' || key === 'constructor') continue;
+                this._findAllImages(node[key], found);
+            }
+        }
+
+        return found;
     }
 }
