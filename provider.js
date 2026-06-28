@@ -5,18 +5,18 @@
  *
  * French manga/manhwa scanlation site (Next.js App Router)
  *
- * API endpoints (from working Tachiyomi extension):
+ * Requires the "Astral-Manga Bridge" tray plugin to be installed.
+ * The plugin uses Seanime's built-in Cloudflare bypass to obtain
+ * cf_clearance cookies and stores them in $store.
+ * This provider reads those cookies and includes them in API requests.
+ *
+ * Without the bridge plugin, Cloudflare will block all API calls.
+ *
+ * API endpoints:
  *   Search:  GET /api/mangas?query=...&page=1&pageSize=20
  *   Manga:   GET /manga/{urlId}  (RSC: 1 header for chapter list)
  *   Chapter: GET /manga/{urlId}/chapter/{chapterUuid}
  *   Images:  GET /api/s3/presign-get?key=...
- *
- * Cloudflare: Goja's fetch() does NOT execute JavaScript, so it can't
- * solve Cloudflare challenges. The user MUST open https://astral-manga.fr
- * in Seanime's built-in browser (WebView) FIRST. That lets Electron's
- * Chromium engine solve the challenge and store cf_clearance in the
- * Electron session cookie jar. If fetch() shares that session, API calls
- * will then work.
  */
 
 class Provider {
@@ -32,51 +32,55 @@ class Provider {
     }
 
     // =================================================================
-    //  Cloudflare — cookie check
+    //  Cloudflare cookie bridge
     // =================================================================
 
     /**
-     * Probe whether we can reach the site. If 403, the user hasn't
-     * visited astral-manga.fr in Seanime's browser yet and Cloudflare
-     * is blocking us. Print a clear action message.
-     *
-     * No setTimeout — Goja doesn't support it.
+     * Read cf_clearance cookies from $store (set by the astral-bridge tray plugin).
+     * Returns a Cookie header string, or empty string if no cookies available.
      */
-    async _checkCookies() {
-        if (typeof this._cookiesOk !== 'undefined') return this._cookiesOk;
-
+    _getCookieHeader() {
         try {
-            var res = await fetch(this.api + '/', {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-                },
-            });
-
-            if (res.status === 200) {
-                console.log('[astral] Cookie check: homepage accessible ✓');
-                this._cookiesOk = true;
-            } else if (res.status === 403) {
-                console.warn('[astral] Cookie check: 403 Forbidden.');
-                console.warn('[astral] ┌─────────────────────────────────────────────┐');
-                console.warn('[astral] │  ACTION REQUIRED                             │');
-                console.warn('[astral] │  Open https://astral-manga.fr in Seanime\'s   │');
-                console.warn('[astral] │  built-in browser (WebView), wait for the     │');
-                console.warn('[astral] │  page to load, then search again.             │');
-                console.warn('[astral] │  This solves the Cloudflare challenge once.   │');
-                console.warn('[astral] └─────────────────────────────────────────────┘');
-                this._cookiesOk = false;
-            } else {
-                console.log('[astral] Cookie check: status ' + res.status + ' (trying anyway)');
-                this._cookiesOk = true;  // not 403 — might work
+            var cookies = $store.get('astral-manga-cookies');
+            if (cookies && cookies.cf_clearance) {
+                var parts = ['cf_clearance=' + cookies.cf_clearance];
+                if (cookies.__cf_bm) {
+                    parts.push('__cf_bm=' + cookies.__cf_bm);
+                }
+                console.log('[astral] Using stored Cloudflare cookies (age: ' +
+                    Math.round((Date.now() - cookies.refreshedAt) / 60000) + 'min)');
+                return parts.join('; ');
             }
         } catch (e) {
-            console.warn('[astral] Cookie check: error — ' + (e.message || e));
-            this._cookiesOk = false;
+            // $store might not be available in older Seanime versions
+            console.warn('[astral] $store not available. Install the Astral-Manga Bridge plugin.');
+        }
+        return '';
+    }
+
+    /**
+     * Check if we have valid cookies and warn if not.
+     */
+    _checkBridge() {
+        if (typeof this._bridgeWarned !== 'undefined') return this._hasCookies;
+
+        var cookies = this._getCookieHeader();
+        if (!cookies) {
+            console.warn('[astral] ┌─────────────────────────────────────────────┐');
+            console.warn('[astral] │  PLUGIN REQUIRED                             │');
+            console.warn('[astral] │  Install the "Astral-Manga Bridge" tray      │');
+            console.warn('[astral] │  plugin to bypass Cloudflare protection.     │');
+            console.warn('[astral] │  Without it, all API calls will get 403.     │');
+            console.warn('[astral] │  Check the plugin tray icon for status.      │');
+            console.warn('[astral] └─────────────────────────────────────────────┘');
+            this._hasCookies = false;
+            this._bridgeWarned = true;
+        } else {
+            this._hasCookies = true;
+            this._bridgeWarned = true;
         }
 
-        return this._cookiesOk;
+        return this._hasCookies;
     }
 
     // =================================================================
@@ -84,7 +88,7 @@ class Provider {
     // =================================================================
 
     /**
-     * Fetch with browser-mimicking headers + X-Requested-With.
+     * Fetch with browser-mimicking headers + Cloudflare cookies.
      */
     async _fetch(url, extraHeaders) {
         var headers = {
@@ -94,6 +98,12 @@ class Provider {
             'Referer': this.api + '/',
             'X-Requested-With': 'XMLHttpRequest',
         };
+
+        // Inject Cloudflare clearance cookies from the bridge plugin
+        var cookieHeader = this._getCookieHeader();
+        if (cookieHeader) {
+            headers['Cookie'] = cookieHeader;
+        }
 
         if (extraHeaders) {
             var keys = Object.keys(extraHeaders);
@@ -273,7 +283,7 @@ class Provider {
         var q = (opts.query || '').trim();
         if (!q) return [];
 
-        await this._checkCookies();
+        this._checkBridge();
 
         var searchUrl = this.api + '/api/mangas' +
             '?query=' + encodeURIComponent(q) +
@@ -282,12 +292,17 @@ class Provider {
 
         try {
             var res = await this._fetch(searchUrl);
-            if (!res.ok) return [];
+            if (!res.ok) {
+                if (res.status === 403) {
+                    console.warn('[astral] search: 403 Forbidden — bridge plugin may need refresh');
+                }
+                return [];
+            }
 
             var text = await res.text();
 
             if (text.indexOf('Just a moment') !== -1) {
-                console.warn('[astral] search: Cloudflare block. Visit astral-manga.fr in Seanime\'s browser first.');
+                console.warn('[astral] search: Cloudflare block. Click the bridge plugin tray icon to refresh.');
                 return [];
             }
 
@@ -363,7 +378,7 @@ class Provider {
     async findChapters(seriesId) {
         if (!this.isUUID(seriesId)) return [];
 
-        await this._checkCookies();
+        this._checkBridge();
 
         try {
             var res = await this._fetch(this.api + '/manga/' + seriesId, { 'RSC': '1' });
@@ -420,7 +435,7 @@ class Provider {
     }
 
     async findChapterPages(chapterId) {
-        await this._checkCookies();
+        this._checkBridge();
 
         try {
             var parts = chapterId.split('|');
