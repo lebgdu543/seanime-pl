@@ -7,7 +7,7 @@ var API_BASE = 'https://astral-manga.fr';
 var STORE_KEY = 'astral-manga-cookies';
 var REFRESH_MS = 25 * 60 * 1000;
 
-function refreshCookies(ctx) {
+var refreshCookies = function(ctx) {
     return ctx.fetch(API_BASE + '/', {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -37,7 +37,7 @@ function refreshCookies(ctx) {
         console.error('[astral-bridge] Error:', e.message || e);
         return false;
     });
-}
+};
 
 $ui.register(function(ctx) {
     console.log('[astral-bridge] Plugin loaded');
