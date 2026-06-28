@@ -1,23 +1,29 @@
+/// <reference path="./manga-provider.d.ts" />
+
 /**
- * Seanime Extension for Astral Manga
- * Implements MangaProvider interface for 'https://astral-manga.fr'.
- * 
- * Based on the Madara WordPress theme (detected via open-source
- * Paperback/Aidoku extension analysis). Uses DOMParser for HTML
- * parsing since Seanime extensions run in a browser context.
- * 
- * Cloudflare: transparent — the plugin runs client-side, so the
- * user's browser already has CF clearance cookies.
+ * Seanime Manga Provider for Astral-Manga.fr
+ *
+ * Site: French manga/manhwa scanlation (Next.js App Router)
+ *
+ * URL structure:
+ *   Manga:   /manga/{mangaUuid}
+ *   Chapter: /manga/{mangaUuid}/chapter/{chapterUuid}
+ *   Images:  /api/s3/presign-get?key=...
+ *
+ * The site serves Next.js RSC data embedded in self.__next_f.push([1,"..."]) 
+ * chunks within the HTML <script> tags. We parse those to extract manga metadata
+ * and chapter data. RSC-only requests (?_rsc=..., RSC: 1 header) return 403.
+ *
+ * Chapter IDs are encoded as "mangaUuid|chapterUuid" so findChapterPages
+ * can reconstruct the URL without an extra lookup.
  */
+
 class Provider {
+    api;
 
     constructor() {
         this.api = 'https://astral-manga.fr';
-        this.sourcePath = 'manga';
     }
-
-    api = '';
-    sourcePath = '';
 
     getSettings() {
         return {
@@ -26,265 +32,310 @@ class Provider {
         };
     }
 
-    // ── Helpers ────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+    //  Helpers
+    // ═══════════════════════════════════════════════════════════
 
-    /** Shared fetch headers that mimic a real browser. */
-    _headers(referer) {
-        return {
-            'Referer': referer || `${this.api}/`,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
-            'Cookie': 'wpmanga-adault=1',  // include adult content in searches
-        };
+    /** Resolve an S3 key (s3:uploads/...) or direct path to a presigned URL */
+    resolveImage(s3Key) {
+        const raw = s3Key.replace(/^s3:/, '');
+        return `${this.api}/api/s3/presign-get?key=${encodeURIComponent(raw)}`;
     }
 
-    /** Safely parse HTML and run a callback on the document. */
-    _parseHTML(html, callback) {
-        try {
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            return callback(doc);
-        } catch (e) {
-            return null;
+    /**
+     * Parse React Server Components wire format from HTML.
+     *
+     * The HTML contains scripts like:
+     *   self.__next_f.push([1,"...escaped JSON string..."])
+     *
+     * We concatenate all chunks, unescape, and walk the resulting tree
+     * to find manga/chapter data.
+     */
+    parseRSC(text) {
+        // Extract all __next_f.push([1,"..."]) chunks
+        const pushRegex = /self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g;
+        let combined = '';
+        let m;
+        while ((m = pushRegex.exec(text)) !== null) {
+            combined += m[1]
+                .replace(/\\"/g, '"')    // unescape double quotes
+                .replace(/\\\\/g, '\\')  // unescape backslashes
+                .replace(/\\n/g, '')     // strip newline escapes
+                .replace(/\\t/g, '');    // strip tab escapes
         }
-    }
 
-    /** Extract the internal WordPress manga ID from the manga page HTML.
-     *  Madara stores it in <script id="wp-manga-js-extra"> as:
-     *  ..."manga_id":"12345"...  (or base64-encoded in the src attr). */
-    _extractMangaId(html) {
-        // Try inline script first
-        const match = html.match(/"manga_id"\s*:\s*"?(\d+)"?/);
-        if (match) return match[1];
+        if (!combined) return null;
 
-        // Try base64-encoded src variant
-        const srcMatch = html.match(/<script[^>]+id="wp-manga-js-extra"[^>]+src="data:text\/javascript;base64,([^"]+)"/);
-        if (srcMatch) {
-            try {
-                const decoded = atob(srcMatch[1]);
-                const idMatch = decoded.match(/"manga_id"\s*:\s*"?(\d+)"?/);
-                if (idMatch) return idMatch[1];
-            } catch (e) { /* fall through */ }
+        // Try parsing the combined string as JSON
+        try {
+            return JSON.parse(combined);
+        } catch {
+            // Fallback: try each chunk individually
+            const lines = combined.split('\n').filter(Boolean);
+            for (const line of lines) {
+                try {
+                    const obj = JSON.parse(line);
+                    // Check if this line encodes a React tree with manga data
+                    if (typeof obj === 'object' && obj !== null) {
+                        const found = this._findBySignature(obj);
+                        if (found) return found;
+                    }
+                } catch { /* continue */ }
+            }
         }
 
         return null;
     }
 
-    /** Extract image URL from an <img> element, trying common lazy-load attributes. */
-    _extractImage(img) {
-        if (!img) return undefined;
-        return img.getAttribute('data-src')
-            || img.getAttribute('data-lazy-src')
-            || img.getAttribute('src')
-            || img.getAttribute('srcset')?.split(',')[0]?.trim()?.split(' ')[0]
-            || undefined;
+    /**
+     * Walk a parsed object tree looking for objects that have
+     * the signature fields of manga or chapter data.
+     */
+    _findBySignature(node, type) {
+        if (!node || typeof node !== 'object') return null;
+
+        // Manga signature: has "title" AND "chapters" array
+        if (!type || type === 'manga') {
+            if (typeof node.title === 'string' && Array.isArray(node.chapters)) {
+                return { type: 'manga', data: node };
+            }
+        }
+
+        // Chapter signature: has "id" AND "images" array (but NOT "chapters")
+        if (!type || type === 'chapter') {
+            if (typeof node.id === 'string' && Array.isArray(node.images) && !Array.isArray(node.chapters)) {
+                return { type: 'chapter', data: node };
+            }
+        }
+
+        // Recurse
+        if (Array.isArray(node)) {
+            for (const item of node) {
+                const found = this._findBySignature(item, type);
+                if (found) return found;
+            }
+        } else if (typeof node === 'object') {
+            for (const key of Object.keys(node)) {
+                if (key === '__proto__' || key === 'constructor') continue;
+                const found = this._findBySignature(node[key], type);
+                if (found) return found;
+            }
+        }
+
+        return null;
     }
 
-    // ── MangaProvider methods ──────────────────────────────
+    /** Fetch the manga page HTML and extract RSC data */
+    async fetchMangaData(mangaId) {
+        const url = `${this.api}/manga/${mangaId}`;
+
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+            },
+        });
+
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} for ${mangaId}`);
+        }
+
+        const html = await res.text();
+        const parsed = this.parseRSC(html);
+
+        if (!parsed) {
+            throw new Error(`No RSC data found in HTML for ${mangaId}`);
+        }
+
+        // If parseRSC returned the whole tree, search for manga data
+        const manga = this._findBySignature(parsed, 'manga');
+        if (manga) return manga.data;
+
+        // If parsed result itself is the manga object
+        if (parsed.title && Array.isArray(parsed.chapters)) {
+            return parsed;
+        }
+
+        throw new Error(`No manga data found in RSC for ${mangaId}`);
+    }
+
+    /** Fetch chapter page HTML and extract image data */
+    async fetchChapterData(mangaId, chapterId) {
+        const url = `${this.api}/manga/${mangaId}/chapter/${chapterId}`;
+
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+            },
+        });
+
+        if (!res.ok) return null;
+
+        const html = await res.text();
+
+        // Strategy 1: Extract S3 keys from the HTML with regex
+        const s3KeyRegex = /s3:uploads\/projects\/[a-f0-9-]{36}\/chapters\/[a-f0-9-]{36}\/[^"'\s,}\]]+/g;
+        const s3Keys = html.match(s3KeyRegex);
+        if (s3Keys && s3Keys.length > 0) {
+            // Filter cover thumbnails, keep page images
+            const pageKeys = s3Keys.filter(k => !k.includes('/cover') && !k.includes('cover-'));
+            return (pageKeys.length > 0 ? pageKeys : s3Keys);
+        }
+
+        // Strategy 2: Parse RSC and find chapter object with images array
+        const parsed = this.parseRSC(html);
+        if (parsed) {
+            const chapter = this._findBySignature(parsed, 'chapter');
+            if (chapter?.data?.images) {
+                return chapter.data.images.map(img => {
+                    if (typeof img === 'string') return img;
+                    // Image objects: { link: "s3:...", key: "...", url: "..." }
+                    return img.link || img.key || img.url || img;
+                });
+            }
+        }
+
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Provider Interface
+    // ═══════════════════════════════════════════════════════════
 
     /**
      * Search for manga by title.
-     * Returns array of { id, title, synonyms?, image? }.
+     *
+     * Fetches the search page HTML and extracts manga links.
+     * If the search returns an exact match, we get the full manga data.
      */
     async search(opts) {
-        const query = opts.query;
-        const url = `${this.api}/?post_type=wp-manga&s=${encodeURIComponent(query)}`;
+        const q = (opts.query || '').trim();
+        if (!q) return [];
+
+        const searchUrl = `${this.api}/search?q=${encodeURIComponent(q)}`;
 
         try {
-            const response = await fetch(url, {
-                method: 'GET',
-                headers: this._headers(),
+            const res = await fetch(searchUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+                },
             });
 
-            if (!response.ok) return [];
+            if (!res.ok) return [];
 
-            const html = await response.text();
+            const html = await res.text();
 
-            return this._parseHTML(html, (doc) => {
-                const results = [];
-                const cards = doc.querySelectorAll('div.c-tabs-item__content');
-
-                for (const card of cards) {
-                    const link = card.querySelector('h3 a');
-                    if (!link) continue;
-
-                    const href = link.getAttribute('href') || '';
-                    // URL: /manga/{slug}/  → extract slug
-                    const slug = href.split('/').filter(Boolean).pop() || '';
-
-                    const title = link.textContent.trim();
-                    if (!title || !slug) continue;
-
-                    const img = card.querySelector('img');
-                    const image = this._extractImage(img);
-
-                    // Latest chapter as subtitle
-                    const chapterLink = card.querySelector('.latest-chap .chapter a');
-                    const subtitle = chapterLink?.textContent.trim() || undefined;
-
-                    results.push({
-                        id: slug,
-                        title: title,
-                        synonyms: subtitle ? [subtitle] : undefined,
-                        image: image,
-                    });
+            // Try RSC parsing first (for exact matches where search redirects to manga page)
+            const parsed = this.parseRSC(html);
+            if (parsed) {
+                const manga = this._findBySignature(parsed, 'manga');
+                if (manga?.data) {
+                    const d = manga.data;
+                    return [{
+                        id: d.id || '',
+                        title: d.title || '',
+                        image: d.cover?.image?.link
+                            ? this.resolveImage(d.cover.image.link)
+                            : (d.image ? this.resolveImage(d.image) : undefined),
+                    }];
                 }
+                // Check if parsed itself is manga
+                if (parsed.title && Array.isArray(parsed.chapters)) {
+                    return [{
+                        id: parsed.id || '',
+                        title: parsed.title,
+                        image: parsed.cover?.image?.link
+                            ? this.resolveImage(parsed.cover.image.link)
+                            : undefined,
+                    }];
+                }
+            }
 
-                return results;
-            }) || [];
+            // Fallback: extract manga links from search results HTML
+            const linkRegex = /\/manga\/([a-f0-9-]{36})[^"]*"[^>]*>([^<]+)</gi;
+            const results = [];
+            const seen = new Set();
+            let match;
+            while ((match = linkRegex.exec(html)) !== null) {
+                const id = match[1];
+                const title = match[2].trim();
+                if (!seen.has(id) && title.length > 1) {
+                    seen.add(id);
+                    results.push({ id, title });
+                }
+            }
+            return results;
         } catch (e) {
+            console.error('search error:', e);
             return [];
         }
     }
 
     /**
-     * Fetch all chapters for a given manga (slug).
-     * Returns array of { id, url, title, chapter, index }.
+     * Get all chapters for a manga.
+     *
+     * Chapters are extracted from the manga page RSC data.
+     * Chapter IDs are encoded as "mangaUuid|chapterUuid" so that
+     * findChapterPages can reconstruct the URL directly.
      */
     async findChapters(mangaId) {
-        const mangaUrl = `${this.api}/${this.sourcePath}/${mangaId}/`;
-
         try {
-            // Step 1: fetch manga page to extract internal WP ID
-            const pageResponse = await fetch(mangaUrl, {
-                method: 'GET',
-                headers: this._headers(),
+            const data = await this.fetchMangaData(mangaId);
+            const chapters = data.chapters || [];
+
+            // Sort by orderId descending (newest first)
+            const sorted = [...chapters].sort((a, b) => (b.orderId || 0) - (a.orderId || 0));
+
+            return sorted.map((ch, index) => {
+                const num = ch.orderId?.toString() || '0';
+                let title = `Chapitre ${num}`;
+                if (ch.name && ch.name.trim()) title = ch.name.trim();
+
+                return {
+                    id: `${mangaId}|${ch.id}`,
+                    url: `${this.api}/manga/${mangaId}/chapter/${ch.id}`,
+                    title,
+                    chapter: num,
+                    index,
+                };
             });
-
-            if (!pageResponse.ok) return [];
-
-            const pageHtml = await pageResponse.text();
-
-            // Verify this page actually has chapters (check for chapter list or manga-js-extra)
-            const hasChapters = pageHtml.includes('wp-manga-chapter')
-                             || pageHtml.includes('manga_id');
-            if (!hasChapters) return [];
-
-            // Step 2: extract internal manga ID
-            const internalId = this._extractMangaId(pageHtml);
-            if (!internalId) {
-                // Fallback: try scraping chapters directly from the manga page
-                return this._parseHTML(pageHtml, (doc) => {
-                    return this._parseChapterList(doc, mangaId);
-                }) || [];
-            }
-
-            // Step 3: AJAX fetch all chapters
-            const ajaxUrl = `${this.api}/${this.sourcePath}/${mangaId}/ajax/chapters`;
-            const ajaxResponse = await fetch(ajaxUrl, {
-                method: 'POST',
-                headers: {
-                    ...this._headers(mangaUrl),
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'X-Requested-With': 'XMLHttpRequest',
-                },
-                body: `action=manga_get_chapters&manga=${internalId}`,
-            });
-
-            if (!ajaxResponse.ok) return [];
-
-            const ajaxHtml = await ajaxResponse.text();
-
-            return this._parseHTML(ajaxHtml, (doc) => {
-                return this._parseChapterList(doc, mangaId);
-            }) || [];
         } catch (e) {
+            console.error('findChapters error:', e);
             return [];
         }
     }
 
     /**
-     * Parse <li class="wp-manga-chapter"> elements from a document.
-     */
-    _parseChapterList(doc, mangaId) {
-        const chapters = [];
-        const items = doc.querySelectorAll('li.wp-manga-chapter');
-
-        for (const item of items) {
-            const link = item.querySelector('a');
-            if (!link) continue;
-
-            const href = link.getAttribute('href') || '';
-            // href looks like: /manga/{slug}/{chapter-slug}/
-            // Extract just the chapter slug part (after the manga slug)
-            const parts = href.split('/').filter(Boolean);
-            const chapterSlug = parts[parts.length - 1] || '';
-
-            // Try to extract chapter number from the slug (e.g. "chapter-150" → 150)
-            let chapNum = '0';
-            const numMatch = chapterSlug.match(/chapitre-(\d+(?:[.-]\d+)?)/i)
-                          || chapterSlug.match(/chapter-(\d+(?:[.-]\d+)?)/i)
-                          || chapterSlug.match(/(\d+(?:[.-]\d+)?)/);
-            if (numMatch) {
-                chapNum = numMatch[1].replace('-', '.');
-            }
-
-            // Build title: use link text or fall back to formatted chapter number
-            const rawTitle = link.textContent.trim();
-            let title = rawTitle;
-            if (!title || title === chapterSlug) {
-                title = `Chapitre ${chapNum}`;
-            }
-
-            // chapterId encodes both slug and chapter slug for findChapterPages
-            const chapterId = `${mangaId}|${chapterSlug}`;
-
-            chapters.push({
-                id: chapterId,
-                url: href.startsWith('http') ? href : `${this.api}${href}`,
-                title: title,
-                chapter: chapNum,
-                index: 0,  // will be set after sorting
-            });
-        }
-
-        // Sort numerically ascending, then set indices
-        chapters.sort((a, b) => parseFloat(a.chapter) - parseFloat(b.chapter));
-        chapters.forEach((c, i) => { c.index = i; });
-
-        return chapters;
-    }
-
-    /**
-     * Fetch all page images for a given chapter.
-     * chapterId format: "slug|chapterSlug"
-     * Returns array of { url, index, headers }.
+     * Get all page images for a chapter.
+     *
+     * chapterId is the composite "mangaUuid|chapterUuid" from findChapters.
      */
     async findChapterPages(chapterId) {
-        const parts = chapterId.split('|');
-        const mangaId = parts[0];
-        const chapterSlug = parts.slice(1).join('|');  // handle slugs with | in them
-
-        const pageUrl = `${this.api}/${this.sourcePath}/${mangaId}/${chapterSlug}/?style=list`;
-        const referer = `${this.api}/${this.sourcePath}/${mangaId}/${chapterSlug}/`;
+        const parts = (chapterId || '').split('|');
+        if (parts.length < 2) {
+            console.error('Invalid chapterId format, expected "mangaUuid|chapterUuid", got:', chapterId);
+            return [];
+        }
+        const mangaUuid = parts[0];
+        const chapterUuid = parts[1];
+        const chapterUrl = `${this.api}/manga/${mangaUuid}/chapter/${chapterUuid}`;
 
         try {
-            const response = await fetch(pageUrl, {
-                method: 'GET',
-                headers: this._headers(referer),
-            });
+            const keys = await this.fetchChapterData(mangaUuid, chapterUuid);
+            if (!keys || keys.length === 0) return [];
 
-            if (!response.ok) return [];
-
-            const html = await response.text();
-
-            return this._parseHTML(html, (doc) => {
-                const pages = [];
-                const images = doc.querySelectorAll('div.page-break > img, div.reading-content img, div.page-break img');
-
-                images.forEach((img, i) => {
-                    const url = this._extractImage(img);
-                    if (url) {
-                        pages.push({
-                            url: url,
-                            index: i,
-                            headers: { 'Referer': referer },
-                        });
-                    }
-                });
-
-                return pages;
-            }) || [];
+            return keys.map((key, i) => ({
+                url: this.resolveImage(key),
+                index: i,
+                headers: { Referer: chapterUrl },
+            }));
         } catch (e) {
+            console.error('findChapterPages error:', e);
             return [];
         }
     }
