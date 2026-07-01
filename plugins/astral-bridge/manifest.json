@@ -8,7 +8,7 @@
   "author": "eren",
   "icon": "",
   "lang": "en",
-  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/55b5e9efe0a078e6d31c1fafc4585505640e75cd/plugins/astral-bridge/code.ts",
+  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/6391534fca6dfeae794114ed541228dece2d9b42/plugins/astral-bridge/code.ts",
   "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/refs/heads/main/plugins/astral-bridge/manifest.json",
   "plugin": {
     "version": "1",
