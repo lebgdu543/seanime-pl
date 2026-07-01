@@ -1,8 +1,8 @@
 {
     "id": "astral-manga",
     "name": "Astral Manga",
-    "description": "Manga provider for Astral-Manga.fr — bypasses Cloudflare via cf_clearance cookie or SearXNG proxy",
-    "version": "3.0.0",
+    "description": "Manga provider for Astral-Manga.fr — auto-bypasse Cloudflare, zéro configuration. Il suffit d'installer, ça marche.",
+    "version": "4.0.0",
     "type": "manga-provider",
     "author": "eren",
     "language": "javascript",
@@ -12,24 +12,7 @@
     "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/manifest.json",
     "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/provider.js",
     "tags": ["french", "manga", "manhwa", "scanlation", "cloudflare"],
-    "userConfig": {
-        "requiresConfig": false,
-        "version": 1,
-        "fields": [
-            {
-                "name": "proxyUrl",
-                "type": "text",
-                "label": "Proxy URL (optional)",
-                "default": "http://localhost:8100",
-                "description": "URL of astral-proxy.py server for SearXNG-based search fallback"
-            },
-            {
-                "name": "cfClearance",
-                "type": "text",
-                "label": "cf_clearance cookie",
-                "default": "",
-                "description": "Paste your cf_clearance value from astral-manga.fr browser cookies for full access"
-            }
-        ]
+    "networkAccess": {
+        "allowedDomains": ["astral-manga.fr", "*.astral-manga.fr"]
     }
 }
