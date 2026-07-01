@@ -1,15 +1,35 @@
 {
     "id": "astral-manga",
-    "name": "Astral-Manga",
-    "description": "French manga/manhwa scanlation provider for Astral-Manga.fr. Parses Next.js RSC self.__next_f.push chunks from HTML.",
-    "version": "2.0.6",
+    "name": "Astral Manga",
+    "description": "Manga provider for Astral-Manga.fr — bypasses Cloudflare via cf_clearance cookie or SearXNG proxy",
+    "version": "3.0.0",
     "type": "manga-provider",
-    "author": "lebgdu543",
+    "author": "eren",
     "language": "javascript",
     "lang": "fr",
-    "website": "https://astral-manga.fr",
     "icon": "https://astral-manga.fr/favicon.ico",
+    "website": "https://astral-manga.fr",
     "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/manifest.json",
     "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/main/provider.js",
-    "tags": ["french", "manga", "manhwa", "scanlation"]
+    "tags": ["french", "manga", "manhwa", "scanlation", "cloudflare"],
+    "userConfig": {
+        "requiresConfig": false,
+        "version": 1,
+        "fields": [
+            {
+                "name": "proxyUrl",
+                "type": "text",
+                "label": "Proxy URL (optional)",
+                "default": "http://localhost:8100",
+                "description": "URL of astral-proxy.py server for SearXNG-based search fallback"
+            },
+            {
+                "name": "cfClearance",
+                "type": "text",
+                "label": "cf_clearance cookie",
+                "default": "",
+                "description": "Paste your cf_clearance value from astral-manga.fr browser cookies for full access"
+            }
+        ]
+    }
 }
