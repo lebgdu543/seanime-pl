@@ -9,8 +9,8 @@
     "lang": "fr",
     "icon": "https://astral-manga.fr/favicon.ico",
     "website": "https://astral-manga.fr",
-    "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/c84dee094de0739c7d616ed4508da7394a28b486/manifest.json",
-    "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/c84dee094de0739c7d616ed4508da7394a28b486/provider.js",
+    "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/04a7dfddd4a8e4ee66af1e23f2d327eb812f16d3/manifest.json",
+    "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/04a7dfddd4a8e4ee66af1e23f2d327eb812f16d3/provider.js",
     "tags": ["french", "manga", "manhwa", "scanlation", "cloudflare"],
     "networkAccess": {
         "allowedDomains": ["astral-manga.fr", "*.astral-manga.fr"]
