@@ -1,14 +1,14 @@
 {
   "id": "astral-bridge",
   "name": "Astral-Manga Bridge",
-  "version": "1.0.5",
+  "version": "2.0.0",
   "language": "typescript",
   "type": "plugin",
-  "description": "Solves Cloudflare challenge for astral-manga.fr manga provider",
+  "description": "[OPTIONAL] Astral-Manga v4.0.0+ gère le Cloudflare seul. Ce bridge est conservé pour compatibilité.",
   "author": "eren",
   "icon": "",
   "lang": "en",
-  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/6391534fca6dfeae794114ed541228dece2d9b42/plugins/astral-bridge/code.ts",
+  "payloadURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/e0b3f501cb36d22cdf65124fa4ffd766fc2719e1/plugins/astral-bridge/code.ts",
   "manifestURI": "https://raw.githubusercontent.com/lebgdu543/seanime-pl/refs/heads/main/plugins/astral-bridge/manifest.json",
   "plugin": {
     "version": "1",
